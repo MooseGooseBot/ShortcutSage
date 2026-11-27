@@ -1,0 +1,15 @@
+[Unit]
+Description=Shortcut Sage daemon (shortcut suggestion engine)
+Documentation=https://github.com/MooseGooseBot/ShortcutSage
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=org.shortcutsage.Daemon
+ExecStart=@BINDIR@/shortcut-sage daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target
