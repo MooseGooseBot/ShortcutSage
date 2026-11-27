@@ -5,7 +5,7 @@ import logging
 import tempfile
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +28,7 @@ shortcuts:
     action: "show_desktop"
     description: "Show desktop"
     category: "desktop"
-  - key: "Meta+Tab"
+  - key: "Meta+W"
     action: "overview"
     description: "Show application overview"
     category: "desktop"
@@ -91,12 +91,18 @@ def run_demo() -> None:
     print(f"Created demo config in: {config_dir}")
 
     # Create daemon in fallback mode (no DBus for demo)
-    daemon = Daemon(str(config_dir), enable_dbus=False, log_events=True)
+    daemon = Daemon(
+        str(config_dir),
+        enable_dbus=False,
+        log_events=True,
+        log_dir=config_dir / "logs",  # keep demo telemetry out of the real log dir
+        state_dir=config_dir / "state",
+    )
     daemon.start()
 
-    # Create overlay in fallback mode
-    app = QApplication([])
-    overlay = OverlayWindow(dbus_available=False)
+    # Create overlay in fallback mode (never auto-hide during the demo)
+    app = QApplication.instance() or QApplication([])
+    overlay = OverlayWindow(dbus_available=False, timeout_seconds=0)
     overlay.show()
 
     print("\nDemonstration: Simulating desktop events...")
@@ -105,19 +111,19 @@ def run_demo() -> None:
     # Simulate some events to show the pipeline in action
     events = [
         {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "type": "desktop_state",
             "action": "show_desktop",
             "metadata": {"window": "unknown", "desktop": 1},
         },
         {
-            "timestamp": (datetime.now()).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "type": "window_state",
             "action": "tile_left",
             "metadata": {"window": "Terminal", "maximized": False},
         },
         {
-            "timestamp": (datetime.now()).isoformat(),
+            "timestamp": datetime.now(UTC).isoformat(),
             "type": "window_focus",
             "action": "window_focus",
             "metadata": {"window": "Browser", "app": "firefox"},
@@ -150,16 +156,26 @@ def run_demo() -> None:
         daemon.set_suggestions_callback(create_callback())
         daemon.send_event(event_json)
 
-        time.sleep(2)  # Pause between events to see changes
+        # Pause between events while keeping the UI responsive
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.02)
 
     print("\nDemo completed! Suggestions should be visible on overlay.")
 
     # Keep the application running
     print("Keep this window open to see the overlay. Press Ctrl+C to exit.")
-    try:
-        app.exec()
-    except KeyboardInterrupt:
-        print("\nShutting down...")
+    import signal
+
+    from PySide6.QtCore import QTimer
+
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    heartbeat = QTimer()  # lets Python run the signal handler while Qt is idle
+    heartbeat.timeout.connect(lambda: None)
+    heartbeat.start(250)
+    app.exec()
+    print("\nShutting down...")
 
     daemon.stop()
 

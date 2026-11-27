@@ -1,255 +1,229 @@
 #!/usr/bin/env python3
-"""Doctor command for Shortcut Sage - diagnose and fix common issues."""
+"""``shortcut-sage-doctor``: diagnose a Shortcut Sage installation."""
 
+from __future__ import annotations
+
+import argparse
+import importlib.util
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
+Check = tuple[str, bool, str]
 
-def check_system_requirements() -> list[tuple[str, bool, str]]:
-    """Check if system requirements are met."""
-    results = []
+KWIN_SCRIPT_ID = "shortcut-sage"
 
-    # Check Python version
-    python_ok = sys.version_info >= (3, 11)
+
+def _config_home() -> Path:
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+
+
+def _data_home() -> Path:
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+
+
+def check_system_requirements() -> list[Check]:
+    """Python, platform and library checks."""
+    results: list[Check] = []
+    v = sys.version_info
+    results.append(("Python 3.11+", v >= (3, 11), f"Current: {v.major}.{v.minor}.{v.micro}"))
+    results.append(("Linux platform", sys.platform.startswith("linux"), f"Current: {sys.platform}"))
+
+    pyside_ok = importlib.util.find_spec("PySide6") is not None
     results.append(
-        (
-            "Python 3.11+",
-            python_ok,
-            f"Current: {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
-        )
+        ("PySide6", pyside_ok, "Available" if pyside_ok else "Missing - pip install PySide6")
     )
-
-    # Check if we're on Linux (for KDE)
-    linux_ok = sys.platform.startswith("linux")
-    results.append(("Linux platform", linux_ok, f"Current: {sys.platform}"))
-
-    # Check if DBus is available
-    import importlib.util
-
-    dbus_ok = importlib.util.find_spec("dbus") is not None
-    if dbus_ok:
-        results.append(("DBus Python library", dbus_ok, "Available"))
-    else:
+    if pyside_ok:
+        qtdbus_ok = importlib.util.find_spec("PySide6.QtDBus") is not None
         results.append(
             (
-                "DBus Python library",
-                dbus_ok,
-                "Not available - install with: pip install 'shortcut-sage[dbus]'",
+                "QtDBus (PySide6)",
+                qtdbus_ok,
+                "Available" if qtdbus_ok else "Missing - your PySide6 build lacks QtDBus",
             )
         )
-
-    # Check PySide6
-    pyside_ok = importlib.util.find_spec("PySide6") is not None
-    if pyside_ok:
-        results.append(("PySide6 library", pyside_ok, "Available"))
-    else:
-        results.append(
-            ("PySide6 library", pyside_ok, "Not available - install with: pip install PySide6")
-        )
-
     return results
 
 
-def check_kde_environment() -> list[tuple[str, bool, str]]:
-    """Check if running in KDE environment."""
-    results = []
+def _dbus_name_has_owner(name: str) -> bool | None:
+    """True/False if the session bus could be queried, None if it could not."""
+    try:
+        from PySide6.QtCore import QCoreApplication
+        from PySide6.QtDBus import QDBusConnection
+    except ImportError:
+        return None
+    if QCoreApplication.instance() is None:
+        QCoreApplication([sys.argv[0] if sys.argv else "shortcut-sage-doctor"])
+    bus = QDBusConnection.sessionBus()
+    if not bus.isConnected():
+        return None
+    reply = bus.interface().isServiceRegistered(name)
+    return bool(reply.value()) if reply.isValid() else None
 
-    # Check if running under X11/Wayland with KDE
+
+def check_kde_environment() -> list[Check]:
+    """Desktop session checks (Plasma 6, KWin, kglobalaccel, session bus)."""
+    results: list[Check] = []
     session_type = os.environ.get("XDG_SESSION_TYPE", "unknown")
     results.append(("Session type", True, f"Detected: {session_type}"))
 
-    # Check for KDE-specific environment variables
-    has_kde = (
-        "KDE" in os.environ.get("DESKTOP_SESSION", "")
-        or "plasma" in os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
-    )
-    results.append(("KDE/Plasma environment", has_kde, "Required for full functionality"))
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    has_kde = "kde" in desktop.lower() or "plasma" in os.environ.get("DESKTOP_SESSION", "").lower()
+    results.append(("KDE Plasma session", has_kde, f"XDG_CURRENT_DESKTOP={desktop or 'unset'}"))
 
-    # Check if kglobalaccel is running
-    try:
-        result = subprocess.run(["pgrep", "kglobalaccel5"], capture_output=True)
-        kglobalaccel_running = result.returncode == 0
-        results.append(
-            ("KGlobalAccel running", kglobalaccel_running, "Required for shortcut detection")
+    plasma_version = os.environ.get("KDE_SESSION_VERSION", "")
+    results.append(
+        (
+            "Plasma 6",
+            plasma_version == "6",
+            f"KDE_SESSION_VERSION={plasma_version or 'unset'} (the KWin script targets Plasma 6)",
         )
-    except FileNotFoundError:
-        results.append(("KGlobalAccel check", False, "pgrep not found - cannot verify"))
+    )
 
+    bus_ok = bool(os.environ.get("DBUS_SESSION_BUS_ADDRESS"))
+    results.append(
+        ("DBus session bus", bus_ok, "Available" if bus_ok else "DBUS_SESSION_BUS_ADDRESS not set")
+    )
+
+    for name, label, why in (
+        ("org.kde.KWin", "KWin running", "needed for the event-reporting KWin script"),
+        ("org.kde.kglobalaccel", "kglobalaccel running", "manages global shortcuts"),
+        ("org.shortcutsage.Daemon", "Shortcut Sage daemon running", "start: shortcut-sage daemon"),
+    ):
+        owned = _dbus_name_has_owner(name) if bus_ok else None
+        if owned is None:
+            results.append((label, False, f"could not query the session bus ({why})"))
+        else:
+            results.append((label, owned, why))
     return results
 
 
-def check_config_files(config_dir: Path) -> list[tuple[str, bool, str]]:
-    """Check if required config files exist."""
-    results = []
+def check_kwin_script() -> list[Check]:
+    """Is the KWin script installed and enabled?"""
+    results: list[Check] = []
+    installed = (_data_home() / "kwin" / "scripts" / KWIN_SCRIPT_ID / "metadata.json").exists()
+    if not installed and shutil.which("kpackagetool6"):
+        try:
+            out = subprocess.run(
+                ["kpackagetool6", "--type=KWin/Script", "--list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            installed = KWIN_SCRIPT_ID in out.split()
+        except (OSError, subprocess.SubprocessError):
+            pass
+    results.append(
+        (
+            "KWin script installed",
+            installed,
+            "OK" if installed else "run scripts/install-kwin-script.sh",
+        )
+    )
 
+    kwinrc = _config_home() / "kwinrc"
+    enabled = False
+    if kwinrc.exists():
+        in_plugins = False
+        for line in kwinrc.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = line.strip()
+            if line.startswith("["):
+                in_plugins = line == "[Plugins]"
+            elif in_plugins and line.replace(" ", "") == f"{KWIN_SCRIPT_ID}Enabled=true":
+                enabled = True
+    results.append(
+        (
+            "KWin script enabled",
+            enabled,
+            "OK" if enabled else "System Settings > Window Management > KWin Scripts",
+        )
+    )
+    return results
+
+
+def check_config_files(config_dir: Path) -> list[Check]:
+    """Do the config files exist and load?"""
+    results: list[Check] = []
     shortcuts_file = config_dir / "shortcuts.yaml"
     rules_file = config_dir / "rules.yaml"
-
     results.append(("shortcuts.yaml exists", shortcuts_file.exists(), str(shortcuts_file)))
     results.append(("rules.yaml exists", rules_file.exists(), str(rules_file)))
+    if shortcuts_file.exists() and rules_file.exists():
+        from sage.config import ConfigError, ConfigLoader, unknown_rule_actions
 
+        loader = ConfigLoader(config_dir)
+        try:
+            shortcuts, rules = loader.reload()
+            warnings = loader.warnings + unknown_rule_actions(shortcuts, rules)
+            detail = f"{len(shortcuts.shortcuts)} shortcuts, {len(rules.rules)} rules"
+            if warnings:
+                detail += f"; {len(warnings)} warning(s): " + "; ".join(warnings[:3])
+            results.append(("Config is valid", not warnings, detail))
+        except ConfigError as e:
+            results.append(("Config is valid", False, str(e)))
     return results
 
 
 def create_default_configs(config_dir: Path) -> bool:
-    """Create default configuration files if they don't exist."""
-    config_dir.mkdir(parents=True, exist_ok=True)
+    """Install the bundled default configuration (existing files are kept)."""
+    from sage.__main__ import install_default_config
 
-    # Default shortcuts config
-    shortcuts_default = """# Shortcut Sage - Default Shortcuts Configuration
-version: "1.0"
-
-shortcuts:
-  # Desktop Navigation
-  - key: "Meta+D"
-    action: "show_desktop"
-    description: "Show desktop"
-    category: "desktop"
-
-  - key: "Meta+Tab"
-    action: "overview"
-    description: "Show overview/task switcher"
-    category: "desktop"
-
-  - key: "Meta+PgUp"
-    action: "switch_desktop_prev"
-    description: "Switch to previous desktop"
-    category: "desktop"
-
-  - key: "Meta+PgDown"
-    action: "switch_desktop_next"
-    description: "Switch to next desktop"
-    category: "desktop"
-
-  # Window Management
-  - key: "Meta+Left"
-    action: "tile_left"
-    description: "Tile window to left half"
-    category: "window"
-
-  - key: "Meta+Right"
-    action: "tile_right"
-    description: "Tile window to right half"
-    category: "window"
-
-  - key: "Meta+Up"
-    action: "maximize"
-    description: "Maximize window"
-    category: "window"
-
-  - key: "Meta+Down"
-    action: "minimize"
-    description: "Minimize window"
-    category: "window"
-"""
-
-    # Default rules config
-    rules_default = """# Shortcut Sage - Default Rules Configuration
-version: "1.0"
-
-rules:
-  # After showing desktop, suggest overview
-  - name: "after_show_desktop"
-    context:
-      type: "event_sequence"
-      pattern: ["show_desktop"]
-      window: 3
-    suggest:
-      - action: "overview"
-        priority: 80
-      - action: "tile_left"
-        priority: 60
-    cooldown: 300
-
-  # After tiling left, suggest tiling right
-  - name: "after_tile_left"
-    context:
-      type: "event_sequence"
-      pattern: ["tile_left"]
-      window: 5
-    suggest:
-      - action: "tile_right"
-        priority: 85
-      - action: "overview"
-        priority: 60
-    cooldown: 180
-"""
-
-    shortcuts_path = config_dir / "shortcuts.yaml"
-    rules_path = config_dir / "rules.yaml"
-
-    if not shortcuts_path.exists():
-        with open(shortcuts_path, "w", encoding="utf-8") as f:
-            f.write(shortcuts_default)
-        print(f"Created default shortcuts config: {shortcuts_path}")
-    else:
-        print(f"Shortcuts config already exists: {shortcuts_path}")
-
-    if not rules_path.exists():
-        with open(rules_path, "w", encoding="utf-8") as f:
-            f.write(rules_default)
-        print(f"Created default rules config: {rules_path}")
-    else:
-        print(f"Rules config already exists: {rules_path}")
-
+    for path in install_default_config(config_dir):
+        print(f"Created {path}")
     return True
 
 
-def main() -> None:
-    """Main doctor command."""
+def _print_section(title: str, results: list[Check]) -> None:
+    print(f"\n{title}")
+    print("-" * len(title))
+    for name, passed, info in results:
+        print(f"{'✓' if passed else '✗'} {name}: {info}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run all checks; returns 1 if any check failed."""
+    parser = argparse.ArgumentParser(prog="shortcut-sage-doctor")
+    parser.add_argument("--config", type=Path, default=_config_home() / "shortcut-sage")
+    parser.add_argument(
+        "--fix", action="store_true", help="Create missing default config files without asking"
+    )
+    args = parser.parse_args(argv)
+
     print("Shortcut Sage - Doctor")
     print("=" * 50)
 
-    # Check system requirements
-    print("\n1. System Requirements")
-    print("-" * 25)
-    sys_results = check_system_requirements()
-    for name, passed, info in sys_results:
-        status = "✓" if passed else "✗"
-        print(f"{status} {name}: {info}")
+    sections = [
+        ("1. System requirements", check_system_requirements()),
+        ("2. KDE environment", check_kde_environment()),
+        ("3. KWin script", check_kwin_script()),
+    ]
+    for title, results in sections:
+        _print_section(title, results)
 
-    # Check KDE environment
-    print("\n2. KDE Environment")
-    print("-" * 18)
-    kde_results = check_kde_environment()
-    for name, passed, info in kde_results:
-        status = "✓" if passed else "✗"
-        print(f"{status} {name}: {info}")
+    config_results = check_config_files(args.config)
+    _print_section(f"4. Configuration ({args.config})", config_results)
+    missing = not all(passed for name, passed, _ in config_results if name.endswith("exists"))
+    if missing:
+        create = args.fix
+        if not create and sys.stdin.isatty():
+            create = input("\nCreate default configuration files? (y/N): ").lower() in ("y", "yes")
+        if create:
+            create_default_configs(args.config)
+            config_results = check_config_files(args.config)
+            _print_section("4b. Configuration after --fix", config_results)
 
-    # Check config files
-    config_dir = Path.home() / ".config" / "shortcut-sage"
-    print(f"\n3. Configuration Files (at {config_dir})")
-    print("-" * 35)
-    config_results = check_config_files(config_dir)
-    for name, passed, info in config_results:
-        status = "✓" if passed else "✗"
-        print(f"{status} {name}: {info}")
-
-    # Offer to create default configs if missing
-    missing_configs = any(not passed for name, passed, info in config_results)
-    if missing_configs:
-        response = input("\nWould you like to create default configuration files? (y/N): ")
-        if response.lower() in ["y", "yes"]:
-            create_default_configs(config_dir)
-
-    # Final summary
-    all_checks = sys_results + kde_results + config_results
-    failed_checks = [name for name, passed, info in all_checks if not passed]
-
-    print("\n4. Summary")
-    print("-" * 9)
-    if failed_checks:
-        print(f"✗ Issues found: {len(failed_checks)}")
-        for check in failed_checks:
-            print(f"  - {check}")
-        print("\nSome functionality may be limited. See documentation for setup instructions.")
-    else:
-        print("✓ All checks passed! Shortcut Sage should work correctly.")
-
-    print("\nDoctor check complete.")
+    all_checks = [c for _, results in sections for c in results] + config_results
+    failed = [name for name, passed, _ in all_checks if not passed]
+    print("\nSummary")
+    print("-------")
+    if failed:
+        print(f"✗ {len(failed)} issue(s): " + ", ".join(failed))
+        return 1
+    print("✓ All checks passed.")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

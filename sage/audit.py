@@ -9,6 +9,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sage.timeutil import parse_timestamp
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +33,8 @@ class TelemetryBatchProcessor:
     def read_telemetry_files(self) -> Iterator[dict[str, Any]]:
         """Read all telemetry entries from NDJSON files."""
         # Look for current and rotated log files
-        for log_path in self.log_dir.glob("telemetry*.ndjson"):
+        # (RotatingFileHandler names backups telemetry.ndjson.1, .2, ...)
+        for log_path in sorted(self.log_dir.glob("telemetry.ndjson*")):
             with open(log_path, encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
@@ -97,9 +100,18 @@ class TelemetryBatchProcessor:
 
         # Check for suggestion acceptance patterns
         suggestion_count = event_counts.get("suggestion_shown", 0)
+        accepted_count = event_counts.get("suggestion_accepted", 0)
+        acceptance_rate = accepted_count / suggestion_count if suggestion_count else 0.0
         if suggestion_count > 0:
-            # If we had suggestions, recommend reviewing them
-            suggestions.append(f"Review {suggestion_count} shown suggestions for relevance")
+            suggestions.append(
+                f"{accepted_count}/{suggestion_count} shown suggestions were accepted "
+                f"({acceptance_rate:.0%})"
+            )
+            if suggestion_count >= 20 and acceptance_rate < 0.05:
+                suggestions.append(
+                    "Very few suggestions are acted on - consider longer cooldowns or "
+                    "removing low-value rules"
+                )
 
         # Summary data
         summary = {
@@ -108,6 +120,9 @@ class TelemetryBatchProcessor:
             "average_durations": {k: round(v, 3) for k, v in avg_durations.items()},
             "time_range": self._get_time_range(events),
             "error_count": error_count,
+            "suggestions_shown": suggestion_count,
+            "suggestions_accepted": accepted_count,
+            "acceptance_rate": round(acceptance_rate, 3),
         }
 
         return AuditReport(
@@ -121,8 +136,8 @@ class TelemetryBatchProcessor:
             ts_str = event.get("timestamp")
             if ts_str:
                 try:
-                    timestamps.append(datetime.fromisoformat(ts_str.replace("Z", "+00:00")))
-                except ValueError:
+                    timestamps.append(parse_timestamp(ts_str))
+                except (TypeError, ValueError):
                     continue
 
         if not timestamps:
