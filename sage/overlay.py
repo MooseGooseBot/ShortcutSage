@@ -5,24 +5,35 @@ from __future__ import annotations
 import json
 import logging
 import sys
-from typing import Any
+from typing import Any, cast
 
-from PySide6.QtCore import QEasingCurve, QPropertyAnimation, Qt
-from PySide6.QtGui import QFont
-from PySide6.QtWidgets import QApplication, QHBoxLayout, QLabel, QWidget
+from PySide6.QtCore import SLOT, QEasingCurve, QPropertyAnimation, Qt, QTimer, Slot
+from PySide6.QtGui import QFont, QGuiApplication
+from PySide6.QtWidgets import (
+    QApplication,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QWidget,
+)
+
+from sage.dbus_daemon import INTERFACE, OBJECT_PATH
 
 logger = logging.getLogger(__name__)
 
-# Try to import DBus, but allow fallback if not available
 try:
-    import dbus
-    from dbus.mainloop.glib import DBusGMainLoop
+    from PySide6.QtDBus import QDBusConnection
 
     DBUS_AVAILABLE = True
-    logger.info("DBus support available for overlay")
-except ImportError:
+except ImportError:  # pragma: no cover - PySide6 ships QtDBus
     DBUS_AVAILABLE = False
-    logger.info("DBus support not available for overlay")
+
+# Identifiers the KWin script uses to find (and pin) the overlay window.
+OVERLAY_WINDOW_TITLE = "Shortcut Sage Overlay"
+OVERLAY_APP_ID = "shortcut-sage-overlay"
+
+MAX_SUGGESTIONS = 3
+DEFAULT_TIMEOUT_SECONDS = 8.0
 
 
 class SuggestionChip(QWidget):
@@ -39,9 +50,12 @@ class SuggestionChip(QWidget):
 
     def setup_ui(self) -> None:
         """Set up the UI for the chip."""
+        self.setObjectName("suggestionChip")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 4)
-        layout.setSpacing(6)
+        layout.setContentsMargins(10, 6, 10, 6)
+        layout.setSpacing(8)
 
         # Key label (the actual shortcut)
         self.key_label = QLabel(self.key)
@@ -49,162 +63,212 @@ class SuggestionChip(QWidget):
         key_font.setBold(True)
         key_font.setPointSize(12)
         self.key_label.setFont(key_font)
-        self.key_label.setStyleSheet("color: #4CAF50;")
+        self.key_label.setStyleSheet("color: #4CAF50; background: transparent; border: none;")
 
         # Description label
         self.desc_label = QLabel(self.description)
         desc_font = QFont()
         desc_font.setPointSize(10)
         self.desc_label.setFont(desc_font)
-        self.desc_label.setStyleSheet("color: white;")
+        self.desc_label.setStyleSheet("color: white; background: transparent; border: none;")
         self.desc_label.setWordWrap(True)
+        self.desc_label.setMaximumWidth(220)
 
         layout.addWidget(self.key_label)
         layout.addWidget(self.desc_label)
 
-        # Styling
+        # Scoped to the chip itself so the labels don't each get a border.
         self.setStyleSheet(
             """
-            QWidget {
+            QWidget#suggestionChip {
                 background-color: rgba(30, 30, 30, 0.9);
                 border: 1px solid #555;
                 border-radius: 6px;
-                padding: 4px;
             }
             """
         )
 
 
 class OverlayWindow(QWidget):
-    """Main overlay window that displays shortcut suggestions."""
+    """Main overlay window that displays shortcut suggestions.
 
-    def __init__(self, dbus_available: bool = True) -> None:
+    The window is shown once and never unmapped again: on Wayland every map creates a
+    new toplevel that the compositor may focus. "Hiding" therefore means clearing the
+    chips and fading the content out, while the transparent, input-transparent window
+    stays put.
+    """
+
+    def __init__(
+        self,
+        dbus_available: bool = True,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+    ) -> None:
         super().__init__()
 
         self.dbus_available = dbus_available and DBUS_AVAILABLE
-        self.dbus_interface = None
+        self.timeout_seconds = timeout_seconds
+        self.chips: list[SuggestionChip] = []
+        self.fade_animation: QPropertyAnimation | None = None
 
         self.setup_window()
         self.setup_ui()
+
+        self.hide_timer = QTimer(self)
+        self.hide_timer.setSingleShot(True)
+        self.hide_timer.timeout.connect(self.clear_suggestions)
+
         self.connect_dbus()
 
         logger.info(f"Overlay initialized (DBus: {self.dbus_available})")
 
     def setup_window(self) -> None:
         """Configure window properties for overlay."""
+        self.setWindowTitle(OVERLAY_WINDOW_TITLE)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.WindowTransparentForInput
             | Qt.WindowType.WindowDoesNotAcceptFocus
+            | Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        # Position at top-left corner
-        self.setGeometry(20, 20, 300, 120)
+        # Top-left corner. Honoured on X11; on Wayland the KWin script places the
+        # window (clients cannot position themselves there).
+        self.setGeometry(20, 20, 300, 60)
 
     def setup_ui(self) -> None:
         """Set up the UI elements."""
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(8)
+        main_layout.setSizeConstraint(QHBoxLayout.SizeConstraint.SetFixedSize)
         self.setLayout(main_layout)
 
-        # Initially empty - suggestions will be added dynamically
-        self.chips: list[SuggestionChip] = []
+        self.opacity_effect = QGraphicsOpacityEffect(self)
+        self.opacity_effect.setOpacity(1.0)
+        self.setGraphicsEffect(self.opacity_effect)
 
-        # Styling
         self.setStyleSheet("background-color: transparent;")
 
     def connect_dbus(self) -> None:
-        """Connect to DBus if available."""
+        """Subscribe to the daemon's Suggestions signal."""
         if not self.dbus_available:
             logger.info("Running overlay in fallback mode (no DBus)")
             return
 
-        try:
-            DBusGMainLoop(set_as_default=True)
-
-            bus = dbus.SessionBus()
-            self.dbus_interface = bus.get_object(
-                "org.shortcutsage.Daemon", "/org/shortcutsage/Daemon"
-            )
-
-            # Connect to the suggestions signal
-            bus.add_signal_receiver(
-                self.on_suggestions,
-                signal_name="Suggestions",
-                dbus_interface="org.shortcutsage.Daemon",
-                path="/org/shortcutsage/Daemon",
-            )
-
-            logger.info("Connected to Shortcut Sage daemon via DBus")
-
-        except Exception as e:
-            logger.error(f"Failed to connect to DBus: {e}")
+        bus = QDBusConnection.sessionBus()
+        if not bus.isConnected():
+            logger.error("Cannot connect to the DBus session bus; overlay in fallback mode")
             self.dbus_available = False
+            return
 
+        # Match on path/interface (not the well-known name) so the subscription keeps
+        # working across daemon restarts and when the daemon starts after the overlay.
+        ok = bus.connect(  # type: ignore[call-overload]  # SLOT() is typed as str
+            "",
+            OBJECT_PATH,
+            INTERFACE,
+            "Suggestions",
+            self,
+            SLOT("on_suggestions(QString)"),
+        )
+        if not ok:
+            logger.error("Failed to subscribe to Suggestions signal: %s", bus.lastError().message())
+            self.dbus_available = False
+            return
+        logger.info("Listening for Shortcut Sage suggestions on DBus")
+
+    @Slot(str)
     def on_suggestions(self, suggestions_json: str) -> None:
-        """Handle incoming suggestions from DBus."""
+        """Handle incoming suggestions (JSON list) from DBus."""
         try:
             suggestions = json.loads(suggestions_json)
+            if not isinstance(suggestions, list):
+                raise ValueError("Suggestions payload must be a JSON list")
             self.update_suggestions(suggestions)
         except Exception as e:
             logger.error(f"Error processing suggestions: {e}")
 
     def update_suggestions(self, suggestions: list[dict[str, Any]]) -> None:
-        """Update the UI with new suggestions."""
-        # Clear existing chips
-        for chip in self.chips:
-            chip.setParent(None)  # Remove from parent but don't delete immediately
-            chip.deleteLater()
+        """Replace the displayed suggestions (max 3)."""
+        self._remove_chips()
 
-        self.chips.clear()
-
-        # Create new chips for suggestions
-        for suggestion in suggestions[:3]:  # Limit to 3 suggestions
-            chip = SuggestionChip(
-                key=suggestion["key"],
-                description=suggestion["description"],
-                priority=suggestion["priority"],
-            )
-            layout = self.layout()
-            if layout:
+        layout = self.layout()
+        for suggestion in suggestions:
+            if len(self.chips) >= MAX_SUGGESTIONS:
+                break
+            try:
+                chip = SuggestionChip(
+                    key=str(suggestion["key"]),
+                    description=str(suggestion.get("description", "")),
+                    priority=int(suggestion.get("priority", 0)),
+                )
+            except (KeyError, TypeError, ValueError, AttributeError) as e:
+                logger.warning("Skipping malformed suggestion %r: %s", suggestion, e)
+                continue
+            if layout is not None:
                 layout.addWidget(chip)
             self.chips.append(chip)
 
-        # Adjust size to fit content
         self.adjustSize()
 
+        if self.chips:
+            self.fade_in()
+            if self.timeout_seconds > 0:
+                self.hide_timer.start(int(self.timeout_seconds * 1000))
+        else:
+            self.hide_timer.stop()
+
+    def _remove_chips(self) -> None:
+        for chip in self.chips:
+            chip.setParent(None)
+            chip.deleteLater()
+        self.chips.clear()
+
+    def clear_suggestions(self) -> None:
+        """Fade out and remove all chips (window stays mapped, fully transparent)."""
+        self.hide_timer.stop()
+        if not self.chips:
+            return
+        self.fade_out()
+
     def set_suggestions_fallback(self, suggestions: list[dict[str, Any]]) -> None:
-        """Update suggestions when not using DBus (for testing)."""
+        """Update suggestions when not using DBus (tests, demo, fallback)."""
         self.update_suggestions(suggestions)
 
-    def fade_in(self) -> None:
-        """Apply fade-in animation."""
-        self.setWindowOpacity(0.0)  # Start transparent
-
-        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_animation.setDuration(300)
-        self.fade_animation.setStartValue(0.0)
-        self.fade_animation.setEndValue(1.0)
+    def _animate(self, start: float, end: float, on_finished: Any = None) -> None:
+        if self.fade_animation is not None:
+            self.fade_animation.stop()
+        self.fade_animation = QPropertyAnimation(self.opacity_effect, b"opacity", self)
+        self.fade_animation.setDuration(250)
+        self.fade_animation.setStartValue(start)
+        self.fade_animation.setEndValue(end)
         self.fade_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        if on_finished is not None:
+            self.fade_animation.finished.connect(on_finished)
         self.fade_animation.start()
 
+    def fade_in(self) -> None:
+        """Fade the content in."""
+        self._animate(self.opacity_effect.opacity(), 1.0)
+
     def fade_out(self) -> None:
-        """Apply fade-out animation."""
-        self.fade_animation = QPropertyAnimation(self, b"windowOpacity")
-        self.fade_animation.setDuration(300)
-        self.fade_animation.setStartValue(1.0)
-        self.fade_animation.setEndValue(0.0)
-        self.fade_animation.setEasingCurve(QEasingCurve.Type.InOutCubic)
-        self.fade_animation.finished.connect(self.hide)
+        """Fade the content out, then drop the chips."""
+
+        def _done() -> None:
+            self._remove_chips()
+            self.adjustSize()
+
+        self._animate(self.opacity_effect.opacity(), 0.0, _done)
+
+
 DEMO_SUGGESTIONS = [
     {
         "action": "overview",
-        "key": "Meta+Tab",
-        "description": "Show application overview",
+        "key": "Meta+W",
+        "description": "Toggle Overview",
         "priority": 80,
     },
     {
@@ -216,13 +280,23 @@ DEMO_SUGGESTIONS = [
 ]
 
 
-def run_overlay(*, enable_dbus: bool = True, demo: bool = False) -> int:
+def run_overlay(
+    *,
+    enable_dbus: bool = True,
+    demo: bool = False,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> int:
     """Launch the overlay UI."""
-    app = QApplication.instance() or QApplication([sys.argv[0]])
-    app.setApplicationName("ShortcutSageOverlay")
+    QGuiApplication.setDesktopFileName(OVERLAY_APP_ID)  # Wayland app_id
+    app = cast(QApplication, QApplication.instance() or QApplication([sys.argv[0]]))
+    app.setApplicationName(OVERLAY_APP_ID)
+    app.setApplicationDisplayName(OVERLAY_WINDOW_TITLE)
     app.setQuitOnLastWindowClosed(False)
 
-    overlay = OverlayWindow(dbus_available=enable_dbus)
+    overlay = OverlayWindow(
+        dbus_available=enable_dbus,
+        timeout_seconds=0 if demo else timeout_seconds,
+    )
     overlay.show()
 
     if demo:
