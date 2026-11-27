@@ -1,0 +1,20 @@
+{
+    "KPlugin": {
+        "Name": "Shortcut Sage",
+        "Description": "Reports desktop actions to the Shortcut Sage daemon so it can suggest keyboard shortcuts, and keeps the suggestion overlay pinned to the top-left corner.",
+        "Icon": "preferences-desktop-keyboard",
+        "Authors": [
+            {
+                "Name": "Shortcut Sage Contributors"
+            }
+        ],
+        "Id": "shortcut-sage",
+        "Version": "0.2.0",
+        "License": "MIT",
+        "Website": "https://github.com/MooseGooseBot/ShortcutSage",
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API": "javascript",
+    "X-Plasma-MainScript": "code/main.js",
+    "KPackageStructure": "KWin/Script"
+}

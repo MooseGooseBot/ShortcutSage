@@ -1,5 +1,9 @@
 # Shortcut Sage - Shortcuts Configuration
-# This file defines all available keyboard shortcuts
+#
+# Action IDs are what the KWin script reports and what rules.yaml refers to.
+# Keys are the KDE Plasma 6 defaults. If you changed your shortcuts, run
+#   export-shortcuts --sync ~/.config/shortcut-sage/shortcuts.yaml
+# to copy your real bindings (from ~/.config/kglobalshortcutsrc) into this file.
 
 version: "1.0"
 
@@ -7,68 +11,78 @@ shortcuts:
   # Desktop Navigation
   - key: "Meta+D"
     action: "show_desktop"
-    description: "Show desktop"
+    description: "Peek at desktop"
     category: "desktop"
 
-  - key: "Meta+Tab"
+  - key: "Meta+W"
     action: "overview"
-    description: "Show overview/task switcher"
+    description: "Toggle Overview"
     category: "desktop"
 
   - key: "Ctrl+F10"
     action: "present_windows"
-    description: "Present windows (current desktop)"
+    description: "Show all windows (Present Windows)"
     category: "desktop"
 
-  - key: "Meta+PgUp"
+  - key: "Ctrl+Meta+Left"
     action: "switch_desktop_prev"
-    description: "Switch to previous desktop"
+    description: "Switch one desktop to the left"
     category: "desktop"
 
-  - key: "Meta+PgDown"
+  - key: "Ctrl+Meta+Right"
     action: "switch_desktop_next"
-    description: "Switch to next desktop"
+    description: "Switch one desktop to the right"
     category: "desktop"
 
   # Window Management
   - key: "Meta+Left"
     action: "tile_left"
-    description: "Tile window to left half"
+    description: "Tile window to the left half"
     category: "window"
 
   - key: "Meta+Right"
     action: "tile_right"
-    description: "Tile window to right half"
+    description: "Tile window to the right half"
     category: "window"
 
   - key: "Meta+Up"
+    action: "tile_top"
+    description: "Tile window to the top half"
+    category: "window"
+
+  - key: "Meta+Down"
+    action: "tile_bottom"
+    description: "Tile window to the bottom half"
+    category: "window"
+
+  - key: "Meta+PgUp"
     action: "maximize"
     description: "Maximize window"
     category: "window"
 
-  - key: "Meta+Down"
+  - key: "Meta+PgDown"
     action: "minimize"
     description: "Minimize window"
     category: "window"
 
   - key: "Alt+F4"
     action: "close_window"
-    description: "Close active window"
+    description: "Close window"
     category: "window"
 
   - key: "Alt+F3"
     action: "window_menu"
-    description: "Show window operations menu"
+    description: "Open window menu"
     category: "window"
 
-  - key: "Meta+Shift+Left"
+  - key: "Meta+Ctrl+Shift+Left"
     action: "move_window_left_desktop"
-    description: "Move window to desktop on the left"
+    description: "Move window one desktop to the left"
     category: "window"
 
-  - key: "Meta+Shift+Right"
+  - key: "Meta+Ctrl+Shift+Right"
     action: "move_window_right_desktop"
-    description: "Move window to desktop on the right"
+    description: "Move window one desktop to the right"
     category: "window"
 
   # Application Launching
@@ -77,7 +91,7 @@ shortcuts:
     description: "Open application launcher"
     category: "launcher"
 
-  - key: "Meta+Space"
+  - key: "Alt+Space"
     action: "krunner"
     description: "Open KRunner"
     category: "launcher"
@@ -87,18 +101,18 @@ shortcuts:
     description: "Open terminal"
     category: "launcher"
 
-  # Screenshots
-  - key: "Print"
+  # Screenshots (Spectacle)
+  - key: "Shift+Print"
     action: "screenshot_full"
-    description: "Take full screenshot"
+    description: "Screenshot the entire desktop"
     category: "screenshot"
 
   - key: "Meta+Print"
     action: "screenshot_window"
-    description: "Screenshot active window"
+    description: "Screenshot the active window"
     category: "screenshot"
 
-  - key: "Shift+Print"
+  - key: "Meta+Shift+Print"
     action: "screenshot_region"
-    description: "Screenshot rectangular region"
+    description: "Screenshot a rectangular region"
     category: "screenshot"
