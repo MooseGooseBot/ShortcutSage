@@ -1,235 +1,185 @@
 # Shortcut Sage
 
-> Context-aware keyboard shortcut suggestions for KDE Plasma (Wayland)
+> Context-aware keyboard shortcut suggestions for KDE Plasma 6
 
-[![CI](https://github.com/Coldaine/ShortcutSage/actions/workflows/ci.yml/badge.svg)](https://github.com/Coldaine/ShortcutSage/actions/workflows/ci.yml)
-[![Visual Tests](https://github.com/Coldaine/ShortcutSage/actions/workflows/visual-tests.yml/badge.svg)](https://github.com/Coldaine/ShortcutSage/actions/workflows/visual-tests.yml)
+[![CI](https://github.com/MooseGooseBot/ShortcutSage/actions/workflows/ci.yml/badge.svg)](https://github.com/MooseGooseBot/ShortcutSage/actions/workflows/ci.yml)
+[![Visual Tests](https://github.com/MooseGooseBot/ShortcutSage/actions/workflows/visual-tests.yml/badge.svg)](https://github.com/MooseGooseBot/ShortcutSage/actions/workflows/visual-tests.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![Code style: ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 
-**Shortcut Sage** is a lightweight, privacy-first desktop tool that watches your workflow and suggests relevant keyboard shortcuts at the perfect moment. Think of it as "autocomplete for your hands."
+**Shortcut Sage** watches what you do on your desktop (show the desktop, tile a window,
+switch virtual desktops…) and suggests the next keyboard shortcut that would help, in a
+small overlay in the top-left corner. Think of it as "autocomplete for your hands."
 
 ## Features
 
-- **Context-aware suggestions**: Suggests up to 3 shortcuts based on your recent actions
-- **Privacy by design**: Only symbolic events (no keylogging), all local processing
-- **Config-driven**: Rules defined in YAML, not hard-coded
-- **Minimal UI**: Small always-on-top overlay, top-left corner
-- **KDE Plasma integration**: Native KWin script for event monitoring
+- **Context-aware suggestions**: up to 3 shortcuts based on your recent actions, the
+  focused application and window title
+- **Learns from you**: when you use a suggested shortcut it counts as accepted, and
+  suggestions you act on rank higher (persisted across restarts)
+- **Config-driven**: rules live in YAML and hot-reload while the daemon runs
+- **Uses your real bindings**: `export-shortcuts --sync` copies your actual KDE
+  shortcuts into the config
+- **Minimal UI**: small always-on-top overlay that never takes focus and fades out
+  after 8 seconds
+- **No keylogging**: only symbolic window-manager events, all processed locally
 
 ## Architecture
 
 ```
-KWin Script → DBus → Daemon (rules engine) → DBus → Overlay UI
+KWin script ──SendEvent──▶ Daemon (ring buffer → features → rules → policy) ──Suggestions──▶ Overlay
+            (DBus, session bus: org.shortcutsage.Daemon)
 ```
 
-- **KWin Event Monitor**: JavaScript script that captures desktop events
-- **Daemon**: Python service that matches contexts to suggestions
-- **Overlay**: PySide6 window displaying suggestions
+| Component | Path | What it does |
+|-----------|------|--------------|
+| KWin script | `kwin/shortcut-sage/` | Reports desktop actions with the focused window's title and app class, and pins the overlay top-left |
+| Daemon | `sage/dbus_daemon.py` | Matches recent actions against `rules.yaml`, applies cooldowns and personalization, emits suggestions |
+| Overlay | `sage/overlay.py` | PySide6 window showing suggestion chips |
+
+The DBus layer uses **QtDBus from PySide6**, so there is no native `dbus-python` or
+PyGObject to build.
 
 ## Requirements
 
-- **OS**: Linux with KDE Plasma (Wayland) 5.27+
-- **Python**: 3.11 or higher
-- **Dependencies**: DBus, PySide6, Pydantic
+- KDE Plasma 6 (Wayland or X11)
+- Python 3.11+
+- PySide6 ≥ 6.6, pydantic, PyYAML, watchdog (installed automatically)
 
 ## Installation
 
-### Development Setup
-
 ```bash
-# Clone repository
-git clone https://github.com/Coldaine/ShortcutSage.git
+git clone https://github.com/MooseGooseBot/ShortcutSage.git
 cd ShortcutSage
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+# 1. Install the Python package (pipx keeps it isolated; pip install --user . works too)
+pipx install .
 
-# Install in development mode
-pip install -e ".[dev]"
+# 2. Install and enable the KWin script
+scripts/install-kwin-script.sh
 
-# Run tests
-pytest
+# 3. Optional: copy your real KDE shortcut bindings into the config
+shortcut-sage init-config
+export-shortcuts --sync ~/.config/shortcut-sage/shortcuts.yaml
 
-# Install KWin script
-bash scripts/install-kwin-script.sh
+# 4. Start everything now and on every login (systemd user units; --xdg for autostart files)
+scripts/install-autostart.sh
 ```
 
-### Configuration
+To run it by hand instead of step 4:
 
-Create your config files in `~/.config/shortcut-sage/`:
+```bash
+shortcut-sage daemon     # creates ~/.config/shortcut-sage with defaults on first run
+shortcut-sage overlay    # in a second terminal
+```
 
-**shortcuts.yaml**: Define your shortcuts
+Check your setup with `shortcut-sage-doctor`.
+
+### Trying it out
+
+- Peek at the desktop (**Meta+D** or the panel button): the overlay suggests Overview and tiling.
+- Drag a window to the left screen edge: it suggests **Meta+Right** to tile the next window.
+- Press **Ctrl+Alt+S** to send a test event from the KWin script.
+- Without KWin: `shortcut-sage send show_desktop`, then check `shortcut-sage status`.
+
+## Configuration
+
+The config lives in `~/.config/shortcut-sage/` and is reloaded automatically when you
+edit it. If a single entry is invalid, it is skipped with a warning and the rest still
+loads.
+
+**shortcuts.yaml**: the shortcuts that can be suggested
+
 ```yaml
 version: "1.0"
 shortcuts:
   - key: "Meta+D"
     action: "show_desktop"
-    description: "Show desktop"
+    description: "Peek at desktop"
     category: "desktop"
 ```
 
-**rules.yaml**: Define context-based suggestion rules
+**rules.yaml**: when to suggest them
+
 ```yaml
 version: "1.0"
 rules:
   - name: "after_show_desktop"
     context:
       type: "event_sequence"
-      pattern: ["show_desktop"]
-      window: 3
+      pattern: ["show_desktop"]   # any of these actions...
+      window: 3                   # ...within the last 3 seconds
+      app: "^org\\.kde\\."        # optional: regex on the focused app class
+      title: "\\.py"              # optional: regex on the focused window title
     suggest:
       - action: "overview"
         priority: 80
-    cooldown: 300
+    cooldown: 300                 # seconds before this rule may show the same suggestion again
 ```
 
-## Usage
+Actions reported by the KWin script: `window_focus`, `show_desktop`, `tile_left`,
+`tile_right`, `tile_top`, `tile_bottom`, `tile_top_left`, `tile_top_right`,
+`tile_bottom_left`, `tile_bottom_right`, `maximize`, `restore`, `minimize`,
+`switch_desktop_next`, `switch_desktop_prev`, `switch_desktop`,
+`move_window_left_desktop`, `move_window_right_desktop`, `krunner`, `test_shortcut`.
+
+## Window titles and logging
+
+Window titles **are** sent to the daemon, because rules can match on them. They are
+**not** written to logs. To include them for testing and debugging:
 
 ```bash
-# Start the daemon with your config directory
-shortcut-sage daemon --config ~/.config/shortcut-sage
-
-# Or use the repo sample config for quick demos
-shortcut-sage daemon --config ./config
-
-# Launch the overlay UI (separate terminal)
-shortcut-sage overlay
-
-# Need a standalone visual check? Use demo mode
-shortcut-sage overlay --demo
+shortcut-sage daemon --log-window-titles      # or SHORTCUT_SAGE_LOG_WINDOW_TITLES=1
+kwriteconfig6 --file kwinrc --group Script-shortcut-sage --key debug true   # KWin journal output
 ```
 
-### Overlay UI
+Logs: `~/.local/share/shortcut-sage/logs/telemetry.ndjson` (rotated).
+Personalization state: `~/.local/share/shortcut-sage/personalization.json`.
 
-- Always-on-top PySide6 window that renders up to 3 suggestion “chips”
-- Positioned in the top-left corner with translucent background and fade animations
-- Listens for DBus `Suggestions` signals from the daemon; `--demo` fills placeholder data without DBus
-- Honors `Qt.WindowDoesNotAcceptFocus` so it never steals focus while you work
+## Command reference
 
-## Automated Visual Testing
-
-The overlay UI is validated using automated screenshot testing with Claude vision:
-
-- **GitHub Actions**: Captures screenshots under xvfb in CI
-- **Claude Vision**: Validates screenshots against specific criteria
-- **5 test scenarios**: Empty, 2 suggestions, single, max 3 (truncation), cleared
-- **Artifacts**: Screenshots available for manual review
-
-See [docs/plans/visual-test-checklist.md](docs/plans/visual-test-checklist.md) for details.
+| Command | Purpose |
+|---------|---------|
+| `shortcut-sage daemon [--config DIR] [--log-dir DIR] [--log-window-titles] [--debug]` | Run the engine |
+| `shortcut-sage overlay [--timeout SECONDS] [--demo]` | Run the overlay (`--timeout 0` = never hide) |
+| `shortcut-sage init-config [--force]` | Write the default config |
+| `shortcut-sage send ACTION [--app APP] [--title TITLE]` | Send a test event |
+| `shortcut-sage status` | Show daemon status as JSON |
+| `shortcut-sage-doctor [--fix]` | Diagnose the installation |
+| `export-shortcuts [--sync] [--all] FILE` | Export or sync your KDE shortcuts |
+| `dev-hints` | Live debug panel (daemon state, buffer, recent telemetry) |
+| `dev-audit LOG_DIR` | Telemetry report (acceptance rate, errors, timing) |
 
 ## Development
 
-### Quick Commands (using justfile)
-
 ```bash
-# Setup environment
-just setup
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]"
 
-# Run all tests
-just test
-
-# Run tests without Qt/DBus (headless CI compatible)
-just test-headless
-
-# Run visual tests (requires graphical environment)
-just test-visual
-
-# Lint and format
-just lint
-just format
-
-# Simulate CI locally
-just ci
-
-# Run daemon/overlay
-just daemon
-just overlay
-just demo
+dbus-run-session -- pytest        # full suite incl. DBus integration tests
+pytest                            # DBus tests are skipped without a session bus
+node --test tests/kwin/main.test.js   # KWin script against a mocked KWin API
+ruff check sage tests && ruff format --check sage tests && mypy sage
 ```
 
-### Running Tests Manually
+Headless runs need `QT_QPA_PLATFORM=offscreen` (the test suite sets it).
+`just --list` shows shortcut recipes. Visual screenshot tests are described in
+[docs/plans/visual-test-checklist.md](docs/plans/visual-test-checklist.md).
 
-```bash
-# All tests with coverage
-pytest
+## Project status
 
-# Unit tests only
-pytest tests/unit
-
-# Integration tests
-pytest tests/integration
-
-# End-to-end tests (requires KDE)
-pytest tests/e2e
-
-# Visual tests (captures screenshots)
-python scripts/visual_test_overlay.py
-
-# Validate screenshots with Claude
-export ANTHROPIC_API_KEY='your-key'
-python scripts/validate_screenshots.py screenshots/
-```
-
-### Code Quality
-
-```bash
-# Lint
-ruff check sage tests
-
-# Format
-ruff format sage tests
-
-# Type check
-mypy sage
-```
-
-## Project Status
-
-Currently implementing **MVP (PR-00 through PR-06)**:
-
-- ✅ PR-00: Repository & CI Bootstrap
-- ✅ PR-01: Config & Schemas
-- ✅ PR-02: Engine Core
-- ✅ PR-03: DBus IPC
-- ✅ PR-04: KWin Event Monitor
-- 🚧 PR-05: Overlay UI
-- ⏳ PR-06: End-to-End Demo
-
-See [implementation-plan.md](implementation-plan.md) for full roadmap.
+MVP (PR-00…PR-06 in [implementation-plan.md](implementation-plan.md)) is functionally
+complete: the KWin script, daemon, overlay, acceptance tracking, personalization,
+exporter, doctor, autostart and dev tools are in place and covered by tests. It still
+needs a hands-on run on a real Plasma 6 session: overlay placement, the show-desktop
+signal, and the tiling heuristics can't be fully exercised in CI.
 
 ## Documentation
 
-- [Product Bible](shortcut-sage-bible.md): Vision, principles, and architecture
-- [Implementation Plan](implementation-plan.md): Phased development plan
-- [Agent Prompt](agent-prompt-pr-train.md): Instructions for autonomous development
-
-## Privacy & Security
-
-- **No keylogging**: Only symbolic events (window focus, desktop switch)
-- **Local processing**: No cloud, no telemetry
-- **Redacted by default**: Window titles not logged
-- **Open source**: Audit the code yourself
-
-## Contributing
-
-Contributions welcome! Please read our [Contributing Guide](CONTRIBUTING.md) first.
+- [Product Bible](shortcut-sage-bible.md): vision, principles, architecture
+- [Implementation Plan](implementation-plan.md): phased plan
+- [Contributing](CONTRIBUTING.md)
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
-
-## Acknowledgments
-
-Built with:
-- [PySide6](https://wiki.qt.io/Qt_for_Python) - UI framework
-- [Pydantic](https://docs.pydantic.dev/) - Data validation
-- [pytest](https://pytest.org/) - Testing framework
-- [ruff](https://github.com/astral-sh/ruff) - Linting & formatting
-
----
-
-**Status**: 🚧 Alpha - Active Development
-
-For questions or issues, please open an issue on GitHub.
+MIT, see [LICENSE](LICENSE).
