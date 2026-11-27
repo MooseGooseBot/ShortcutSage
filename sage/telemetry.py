@@ -3,6 +3,7 @@
 import json
 import logging
 import logging.handlers
+import os
 import threading
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -39,9 +40,10 @@ class MetricsCollector:
     """Collects and aggregates metrics for observability."""
 
     def __init__(self) -> None:
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # re-entrant: export_metrics calls other getters
         self.counters: dict[str, int] = defaultdict(int)
-        self.histograms: dict[str, list[float]] = defaultdict(list)
+        # Bounded so a long-running daemon does not grow without limit
+        self.histograms: dict[str, deque[float]] = defaultdict(lambda: deque(maxlen=10000))
         self.events: deque[TelemetryEvent] = deque(
             maxlen=10000
         )  # Circular buffer for recent events
@@ -70,7 +72,7 @@ class MetricsCollector:
     def get_histogram_stats(self, name: str) -> dict[str, float]:
         """Get statistics for a histogram."""
         with self._lock:
-            values = self.histograms.get(name, [])
+            values = list(self.histograms.get(name, ()))
             if not values:
                 return {"count": 0, "avg": 0.0, "min": 0.0, "max": 0.0}
 
@@ -103,54 +105,75 @@ class MetricsCollector:
                 hist.clear()
 
 
+# Metadata keys that may contain window titles / document names.
+SENSITIVE_KEYS = frozenset({"window", "title", "caption", "window_title", "document", "url"})
+REDACTED = "[redacted]"
+LOG_WINDOW_TITLES_ENV = "SHORTCUT_SAGE_LOG_WINDOW_TITLES"
+
+
+def window_title_logging_from_env() -> bool:
+    """True if window-title logging was requested via environment (testing only)."""
+    return os.environ.get(LOG_WINDOW_TITLES_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 class LogRedactor:
-    """Redacts potentially sensitive information from logs."""
+    """Removes window titles (and similar) from data before it is written to logs.
+
+    Window titles are *required* at runtime (rules can match on them), so they are
+    always sent to the daemon and kept in memory. They are only kept out of log files.
+    Set ``enabled=False`` (``--log-window-titles`` or
+    ``SHORTCUT_SAGE_LOG_WINDOW_TITLES=1``) to log them for testing/debugging.
+    """
 
     def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        # Patterns to redact
-        self.redaction_patterns = [
-            # These are general patterns that might contain PII
-            r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",  # IP addresses
-            r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b",  # Email
-            # Window titles and app names could potentially contain PII
-        ]
 
-    def redact(self, text: str) -> str:
-        """Redact sensitive information from text."""
+    def redact(self, value: Any) -> Any:
+        """Return a copy of ``value`` with sensitive keys masked (recursively)."""
         if not self.enabled:
-            return text
-
-        # For now, we'll just return the text as-is to avoid over-redacting
-        # In a real implementation, we'd have more sophisticated redaction
-        # based on our privacy requirements
-        return text
+            return value
+        if isinstance(value, dict):
+            return {
+                k: (REDACTED if str(k).lower() in SENSITIVE_KEYS and v else self.redact(v))
+                for k, v in value.items()
+            }
+        if isinstance(value, list | tuple):
+            return [self.redact(v) for v in value]
+        return value
 
 
 class RotatingTelemetryLogger:
-    """Telemetry logger with rotation and redaction."""
+    """Telemetry logger (NDJSON) with rotation and redaction."""
 
     def __init__(
-        self, log_dir: str | Path, max_bytes: int = 10 * 1024 * 1024, backup_count: int = 5
+        self,
+        log_dir: str | Path,
+        max_bytes: int = 10 * 1024 * 1024,
+        backup_count: int = 5,
+        log_window_titles: bool = False,
     ):
         self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(exist_ok=True)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
 
         # Set up the NDJSON log file with rotation
         self.log_file = self.log_dir / "telemetry.ndjson"
         self.handler = logging.handlers.RotatingFileHandler(
             self.log_file, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
         )
+        self.handler.setFormatter(logging.Formatter("%(message)s"))
 
-        # Create logger
-        self.logger = logging.getLogger("telemetry")
+        # Dedicated logger; drop handlers left over from a previous instance so lines
+        # are never duplicated (e.g. several daemons created in one process).
+        self.logger = logging.getLogger("shortcut_sage.telemetry")
+        for old in list(self.logger.handlers):
+            self.logger.removeHandler(old)
+            old.close()
         self.logger.setLevel(logging.INFO)
         self.logger.addHandler(self.handler)
-
-        # Disable propagation to avoid duplicate logs
         self.logger.propagate = False
 
-        self.redactor = LogRedactor(enabled=True)
+        self.log_window_titles = log_window_titles or window_title_logging_from_env()
+        self.redactor = LogRedactor(enabled=not self.log_window_titles)
         self.metrics = MetricsCollector()
 
     def log_event(
@@ -160,11 +183,13 @@ class RotatingTelemetryLogger:
         properties: dict[str, Any] | None = None,
     ) -> None:
         """Log an event with timing and properties."""
+        safe_properties = self.redactor.redact(properties or {})
         event = TelemetryEvent(
             event_type=event_type,
             timestamp=datetime.now(),
             duration=duration,
-            properties=properties or {},
+            properties=safe_properties,
+            redacted=self.redactor.enabled,
         )
 
         # Record in metrics
@@ -175,22 +200,21 @@ class RotatingTelemetryLogger:
 
         self.metrics.increment_counter(event_type.value)
 
-        # Prepare log entry in NDJSON format
         log_entry = {
-            "timestamp": event.timestamp.isoformat(),
+            "timestamp": event.timestamp.astimezone().isoformat(),
             "event_type": event_type.value,
             "duration": duration,
-            "properties": self.redactor.redact(json.dumps(properties)) if properties else None,
+            "properties": safe_properties or None,
         }
 
         # Write as NDJSON (newline-delimited JSON)
-        self.logger.info(json.dumps(log_entry))
+        self.logger.info(json.dumps(log_entry, default=str))
 
     def log_error(self, error_msg: str, context: dict[str, Any] | None = None) -> None:
         """Log an error event."""
         self.log_event(
             EventType.ERROR_OCCURRED,
-            properties={"error": self.redactor.redact(error_msg), "context": context or {}},
+            properties={"error": error_msg, "context": context or {}},
         )
 
     def export_metrics(self) -> dict[str, Any]:
@@ -207,11 +231,21 @@ class RotatingTelemetryLogger:
 _telemetry_logger: RotatingTelemetryLogger | None = None
 
 
-def init_telemetry(log_dir: str | Path) -> RotatingTelemetryLogger:
-    """Initialize the telemetry system."""
+def init_telemetry(log_dir: str | Path, log_window_titles: bool = False) -> RotatingTelemetryLogger:
+    """Initialize (or re-initialize) the global telemetry system."""
     global _telemetry_logger
-    _telemetry_logger = RotatingTelemetryLogger(log_dir)
+    if _telemetry_logger is not None:
+        _telemetry_logger.close()
+    _telemetry_logger = RotatingTelemetryLogger(log_dir, log_window_titles=log_window_titles)
     return _telemetry_logger
+
+
+def shutdown_telemetry() -> None:
+    """Close the global telemetry logger (flushes the file handle)."""
+    global _telemetry_logger
+    if _telemetry_logger is not None:
+        _telemetry_logger.close()
+        _telemetry_logger = None
 
 
 def get_telemetry() -> RotatingTelemetryLogger | None:

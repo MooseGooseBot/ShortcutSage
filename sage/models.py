@@ -1,5 +1,6 @@
 """Pydantic models for configuration schemas."""
 
+import re
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
@@ -54,8 +55,30 @@ class ContextMatch(BaseModel):
     """Context matching condition."""
 
     type: Literal["event_sequence", "recent_window", "desktop_state"]
-    pattern: str | list[str] = Field(description="Pattern to match")
+    pattern: str | list[str] = Field(
+        description="Action ID (or list of action IDs, any of which matches)"
+    )
     window: int = Field(default=3, ge=1, le=10, description="Rolling window size (seconds)")
+    app: str | None = Field(
+        default=None,
+        description="Optional regex (case-insensitive) the focused app class must match",
+    )
+    title: str | None = Field(
+        default=None,
+        description="Optional regex (case-insensitive) the focused window title must match",
+    )
+
+    @field_validator("app", "title")
+    @classmethod
+    def validate_regex(cls, v: str | None) -> str | None:
+        """Validate optional regex filters compile."""
+        if v is None:
+            return None
+        try:
+            re.compile(v)
+        except re.error as e:
+            raise ValueError(f"Invalid regular expression {v!r}: {e}") from e
+        return v
 
     @field_validator("pattern")
     @classmethod
@@ -64,11 +87,12 @@ class ContextMatch(BaseModel):
         if isinstance(v, str):
             if not v.strip():
                 raise ValueError("Pattern cannot be empty")
-            return v.strip()
+            return v.strip().lower()
         elif isinstance(v, list):
-            if not v:
+            cleaned = [p.strip().lower() for p in v if p.strip()]
+            if not cleaned:
                 raise ValueError("Pattern list cannot be empty")
-            return [p.strip() for p in v if p.strip()]
+            return cleaned
         return v
 
 
