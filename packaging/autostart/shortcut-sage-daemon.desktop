@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Shortcut Sage Daemon
+Comment=Context-aware keyboard shortcut suggestions for KDE Plasma (engine)
+Exec=shortcut-sage daemon
+Icon=preferences-desktop-keyboard
+NoDisplay=true
+StartupNotify=false
+X-KDE-autostart-phase=2
+OnlyShowIn=KDE;

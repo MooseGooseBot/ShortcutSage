@@ -1,206 +1,323 @@
-"""DBus daemon for Shortcut Sage (with fallback for systems without DBus)."""
+"""Shortcut Sage daemon: rules engine exposed on the session bus via QtDBus.
+
+DBus contract (service/interface ``org.shortcutsage.Daemon``, path
+``/org/shortcutsage/Daemon``):
+
+* ``SendEvent(s event_json)`` - called by the KWin script for every desktop event.
+* ``Ping() -> s`` - returns ``"pong"``.
+* ``GetBufferState() -> s`` - JSON list of the events currently in the ring buffer
+  (diagnostics/tests; includes metadata such as window titles).
+* ``GetStatus() -> s`` - JSON object with daemon status.
+* signal ``Suggestions(s suggestions_json)`` - JSON list of
+  ``{action, key, description, priority}`` emitted whenever there is something new
+  to show (and an empty list when a shown suggestion was accepted).
+
+QtDBus ships with PySide6, so no native ``dbus-python``/PyGObject build is needed.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 import threading
 import time
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from sage.__version__ import __version__
 from sage.buffer import RingBuffer
-from sage.config import ConfigLoader
-from sage.features import FeatureExtractor
+from sage.config import ConfigError, ConfigLoader, unknown_rule_actions
+from sage.events import Event
+from sage.features import CONTEXT_EVENT_TYPES, FeatureExtractor
 from sage.matcher import RuleMatcher
 from sage.policy import PolicyEngine, SuggestionResult
 from sage.telemetry import EventType, init_telemetry, log_event
+from sage.timeutil import now_utc, to_aware
 
 logger = logging.getLogger(__name__)
 
-# Try to import DBus, but allow fallback if not available
-try:
-    import dbus
-    import dbus.service
-    from dbus.mainloop.glib import DBusGMainLoop, threads_init
-    from gi.repository import GLib  # type: ignore[import-not-found]
+BUS_NAME = "org.shortcutsage.Daemon"
+OBJECT_PATH = "/org/shortcutsage/Daemon"
+INTERFACE = "org.shortcutsage.Daemon"
 
-    threads_init()
+# How long after being shown a suggestion counts as "accepted" if the user performs it.
+DEFAULT_ACCEPTANCE_WINDOW = 30.0
+MIN_BUFFER_WINDOW = 3.0
+
+try:
+    from PySide6.QtCore import ClassInfo, QCoreApplication, QObject, QTimer, Signal, Slot
+    from PySide6.QtDBus import QDBusAbstractAdaptor, QDBusConnection
+
     DBUS_AVAILABLE = True
-    logger.info("DBus support available")
-except ImportError:
+except ImportError:  # pragma: no cover - PySide6 is a hard dependency
     DBUS_AVAILABLE = False
-    logger.info("DBus support not available, using fallback")
+
+
+class DaemonError(RuntimeError):
+    """Raised when the daemon cannot start (e.g. bus unavailable or name taken)."""
+
+
+def default_data_dir() -> Path:
+    """``$XDG_DATA_HOME/shortcut-sage`` (``~/.local/share/shortcut-sage``)."""
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "shortcut-sage"
+
+
+def suggestions_to_json(suggestions: list[SuggestionResult]) -> str:
+    """Serialize suggestions using the public DBus JSON contract."""
+    return json.dumps(
+        [
+            {
+                "action": s.action,
+                "key": s.key,
+                "description": s.description,
+                "priority": s.priority,
+            }
+            for s in suggestions
+        ]
+    )
 
 
 class Daemon:
-    """DBus service for Shortcut Sage daemon (with fallback implementation)."""
+    """Shortcut Sage daemon (works with or without DBus)."""
+
+    BUS_NAME = BUS_NAME
+    OBJECT_PATH = OBJECT_PATH
 
     def __init__(
         self,
-        config_dir: str,
+        config_dir: str | Path,
         enable_dbus: bool = True,
         log_events: bool = True,
         log_dir: str | Path | None = None,
+        *,
+        state_dir: str | Path | None = None,
+        log_window_titles: bool = False,
+        acceptance_window: float = DEFAULT_ACCEPTANCE_WINDOW,
     ) -> None:
-        """Initialize the daemon."""
+        """Initialize the daemon.
+
+        Args:
+            config_dir: Directory with shortcuts.yaml and rules.yaml
+            enable_dbus: Register on the session bus when :meth:`start` is called
+            log_events: Log per-event processing details
+            log_dir: Telemetry directory (default ``~/.local/share/shortcut-sage/logs``)
+            state_dir: Where personalization state is stored (default: parent of log_dir)
+            log_window_titles: Write window titles into telemetry (testing only)
+            acceptance_window: Seconds during which performing a shown suggestion
+                counts as accepting it
+        """
         self.enable_dbus = enable_dbus and DBUS_AVAILABLE
-        self.log_events = log_events  # Whether to log events and suggestions
+        self.log_events = log_events
+        self.log_window_titles = log_window_titles
+        self.acceptance_window = acceptance_window
 
-        # Initialize telemetry
-        if log_dir is None:
-            # Default log directory
-            log_dir = Path.home() / ".local" / "share" / "shortcut-sage" / "logs"
-        self.log_dir = Path(log_dir)
+        self.log_dir = Path(log_dir) if log_dir is not None else default_data_dir() / "logs"
         self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.state_dir = Path(state_dir) if state_dir is not None else self.log_dir.parent
+        self.state_file = self.state_dir / "personalization.json"
 
-        self.telemetry = init_telemetry(self.log_dir)
-
-        # Log daemon start
+        self.telemetry = init_telemetry(self.log_dir, log_window_titles=log_window_titles)
         log_event(
             EventType.DAEMON_START,
-            properties={"dbus_enabled": self.enable_dbus, "config_dir": str(config_dir)},
+            properties={
+                "dbus_enabled": self.enable_dbus,
+                "config_dir": str(config_dir),
+                "version": __version__,
+            },
         )
 
-        # Load configuration
+        self._lock = threading.RLock()
+
+        # Load configuration (fail-soft per entry; structural errors raise ConfigError)
         self.config_loader = ConfigLoader(config_dir)
         self.shortcuts_config, self.rules_config = self.config_loader.reload()
+        for warning in self.config_loader.warnings + unknown_rule_actions(
+            self.shortcuts_config, self.rules_config
+        ):
+            logger.warning(warning)
 
-        # Initialize engine components
-        self.buffer = RingBuffer(window_seconds=3.0)
-        self.feature_extractor = FeatureExtractor(self.buffer)
+        # Engine components
         self.rule_matcher = RuleMatcher(self.rules_config.rules)
+        self.buffer = RingBuffer(window_seconds=self._buffer_window())
+        self.feature_extractor = FeatureExtractor(self.buffer)
         self.policy_engine = PolicyEngine({s.action: s for s in self.shortcuts_config.shortcuts})
+        self._load_state()
 
-        # Set up config reload callback
+        # action -> (rule name, time shown) for suggestions currently on screen
+        self._pending: dict[str, tuple[str, datetime]] = {}
+
         self._setup_config_reload()
 
-        # Store callback for suggestions (to be set by caller if not using DBus)
         self.suggestions_callback: Callable[[list[SuggestionResult]], None] | None = None
-        self._dbus_loop: GLib.MainLoop | None = None
-        self._dbus_thread: threading.Thread | None = None
-        self._dbus_service: dbus.service.Object | None = None
+        self._dbus_object: Any = None
+        self._dbus_adaptor: Any = None
+        self._dbus_connection: Any = None
+        self._started = False
 
-        if self.enable_dbus:
-            self._init_dbus_service()
+        logger.info(
+            "Daemon initialized (DBus: %s, rules: %d, shortcuts: %d)",
+            self.enable_dbus,
+            len(self.rules_config.rules),
+            len(self.shortcuts_config.shortcuts),
+        )
 
-        logger.info(f"Daemon initialized (DBus: {self.enable_dbus}, logging: {self.log_events})")
-
-    def _init_dbus_service(self) -> None:
-        """Initialize the DBus service if available."""
-        if not self.enable_dbus:
-            return
-
-        # Initialize the D-Bus main loop
-        DBusGMainLoop(set_as_default=True)
-
-        # Define the D-Bus service name and object path
-        self.BUS_NAME = "org.shortcutsage.Daemon"
-        self.OBJECT_PATH = "/org/shortcutsage/Daemon"
-        logger.debug("DBus service metadata initialized")
+    # ------------------------------------------------------------------ helpers
+    def _buffer_window(self) -> float:
+        return max(MIN_BUFFER_WINDOW, float(self.rule_matcher.max_window))
 
     def _buffer_snapshot(self) -> list[dict[str, Any]]:
         """Return the ring buffer contents as JSON-serializable dictionaries."""
-        snapshot: list[dict[str, Any]] = []
-        for event in self.buffer.recent():
-            snapshot.append(
-                {
-                    "action": event.action,
-                    "type": event.type,
-                    "timestamp": event.timestamp.isoformat(),
-                    "metadata": dict(event.metadata or {}),
-                }
-            )
-        return snapshot
+        with self._lock:
+            events = self.buffer.recent()
+        return [
+            {
+                "action": event.action,
+                "type": event.type,
+                "timestamp": to_aware(event.timestamp).isoformat(),
+                "metadata": dict(event.metadata or {}),
+            }
+            for event in events
+        ]
 
+    def get_buffer_state_json(self) -> str:
+        """JSON list of buffered events (diagnostics)."""
+        return json.dumps(self._buffer_snapshot(), default=str)
+
+    def get_status(self) -> dict[str, Any]:
+        """Daemon status summary."""
+        with self._lock:
+            return {
+                "version": __version__,
+                "dbus": self._dbus_object is not None,
+                "rules": len(self.rule_matcher.rules),
+                "shortcuts": len(self.policy_engine.shortcuts),
+                "buffer_events": len(self.buffer),
+                "buffer_window": self.buffer.window_seconds,
+                "pending_suggestions": sorted(self._pending),
+                "config_dir": str(self.config_loader.config_dir),
+                "log_dir": str(self.log_dir),
+            }
+
+    # ------------------------------------------------------------------ persistence
+    def _load_state(self) -> None:
+        if not self.state_file.exists():
+            return
+        try:
+            state = json.loads(self.state_file.read_text(encoding="utf-8"))
+            self.policy_engine.import_state(state)
+            logger.info("Loaded personalization state from %s", self.state_file)
+        except Exception as e:  # corrupted state must never prevent startup
+            logger.warning("Ignoring unreadable personalization state %s: %s", self.state_file, e)
+
+    def save_state(self) -> None:
+        """Persist personalization data (atomic write)."""
+        try:
+            self.state_dir.mkdir(parents=True, exist_ok=True)
+            tmp = self.state_file.with_suffix(".json.tmp")
+            with self._lock:
+                payload = json.dumps(self.policy_engine.export_state(), indent=2)
+            tmp.write_text(payload, encoding="utf-8")
+            tmp.replace(self.state_file)
+        except Exception as e:
+            logger.warning("Could not save personalization state: %s", e)
+
+    # ------------------------------------------------------------------ config reload
     def _setup_config_reload(self) -> None:
-        """Set up configuration reload callback."""
+        """Set up configuration hot-reload."""
         from sage.watcher import ConfigWatcher
 
-        def reload_config(filename: str) -> None:
-            """Reload config when file changes."""
-            try:
-                if filename == "shortcuts.yaml":
-                    shortcuts_config = self.config_loader.load_shortcuts()
+        self.watcher = ConfigWatcher(self.config_loader.config_dir, self.reload_config)
+
+    def reload_config(self, filename: str) -> bool:
+        """Reload one config file; keeps the previous config if the new one is invalid."""
+        try:
+            if filename == "shortcuts.yaml":
+                shortcuts_config = self.config_loader.load_shortcuts()
+                with self._lock:
+                    self.shortcuts_config = shortcuts_config
                     self.policy_engine.shortcuts = {s.action: s for s in shortcuts_config.shortcuts}
-                elif filename == "rules.yaml":
-                    rules_config = self.config_loader.load_rules()
+            elif filename == "rules.yaml":
+                rules_config = self.config_loader.load_rules()
+                with self._lock:
+                    self.rules_config = rules_config
                     self.rule_matcher = RuleMatcher(rules_config.rules)
-                logger.info(f"Reloaded config: {filename}")
-            except Exception as e:
-                logger.error(f"Failed to reload config {filename}: {e}")
+                    self.buffer.set_window(self._buffer_window())
+            else:
+                return False
+        except ConfigError as e:
+            logger.error("Failed to reload %s (keeping previous config): %s", filename, e)
+            log_event(
+                EventType.ERROR_OCCURRED,
+                properties={"error": str(e), "error_type": "ConfigError", "file": filename},
+            )
+            return False
 
-        self.watcher = ConfigWatcher(self.config_loader.config_dir, reload_config)
+        for warning in self.config_loader.warnings + unknown_rule_actions(
+            self.shortcuts_config, self.rules_config
+        ):
+            logger.warning(warning)
+        logger.info("Reloaded config: %s", filename)
+        log_event(EventType.CONFIG_RELOAD, properties={"file": filename})
+        return True
 
+    # ------------------------------------------------------------------ events
     def send_event(self, event_json: str) -> str:
-        """Receive and process an event from KWin or other sources."""
-        start_time = time.time()
+        """Process one event and return the suggestions JSON.
+
+        Raises:
+            ValueError: for malformed JSON or invalid event payloads (the DBus layer
+                catches this, logs it and keeps running).
+        """
+        start_time = time.perf_counter()
 
         try:
-            # Parse the event JSON
-            event_data = json.loads(event_json)
+            event = Event.from_dict(json.loads(event_json))
+            now = now_utc()
 
-            # Create an event object
-            from datetime import datetime
+            with self._lock:
+                self.buffer.add(event)
+                accepted = self._check_acceptance(event, now)
 
-            from sage.events import Event
+                features = self.feature_extractor.extract()
+                matches = self.rule_matcher.match(features)
+                suggestions = self.policy_engine.apply(
+                    matches, now=now, exclude_actions={event.action}
+                )
+                for s in suggestions:
+                    self._pending[s.action] = (s.rule, now)
 
-            timestamp_str = event_data["timestamp"]
-            if isinstance(timestamp_str, str):
-                timestamp = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
-            else:
-                timestamp = timestamp_str
+            processing_time = time.perf_counter() - start_time
+            latency = (now - to_aware(event.timestamp)).total_seconds()
 
-            event = Event(
-                timestamp=timestamp,
-                type=event_data["type"],
-                action=event_data["action"],
-                metadata=event_data.get("metadata"),
-            )
-
-            # Add event to buffer
-            self.buffer.add(event)
-
-            # Extract features and match rules
-            features = self.feature_extractor.extract()
-            matches = self.rule_matcher.match(features)
-            suggestions = self.policy_engine.apply(matches, now=datetime.now())
-
-            # Calculate processing metrics
-            processing_time = time.time() - start_time
-            latency = (datetime.now() - timestamp).total_seconds()
-
-            # Log the event processing if enabled
             if self.log_events:
                 logger.info(
-                    f"Event processed: {event.action} -> {len(suggestions)} suggestions "
-                    f"(processing_time: {processing_time:.3f}s, "
-                    f"latency: {latency:.3f}s)"
+                    "Event processed: %s -> %d suggestions (processing %.1f ms, latency %.1f ms)",
+                    event.action,
+                    len(suggestions),
+                    processing_time * 1000,
+                    latency * 1000,
                 )
+                if self.log_window_titles and event.metadata:
+                    logger.info("Event metadata: %s", event.metadata)
 
-                # Log detailed suggestions if any
-                for i, suggestion in enumerate(suggestions):
-                    logger.debug(
-                        f"Suggestion {i + 1}: {suggestion.action} ({suggestion.key}) - priority {suggestion.priority}"
-                    )
+            properties: dict[str, Any] = {
+                "action": event.action,
+                "type": event.type,
+                "suggestions_count": len(suggestions),
+                "processing_time": processing_time,
+                "latency": latency,
+            }
+            if event.metadata:
+                properties["metadata"] = event.metadata  # titles redacted unless enabled
+            log_event(EventType.EVENT_RECEIVED, duration=processing_time, properties=properties)
 
-            # Log to telemetry
-            log_event(
-                EventType.EVENT_RECEIVED,
-                duration=processing_time,
-                properties={
-                    "action": event.action,
-                    "type": event.type,
-                    "suggestions_count": len(suggestions),
-                    "processing_time": processing_time,
-                    "latency": latency,
-                },
-            )
-
-            # Log each suggestion shown
             for suggestion in suggestions:
                 log_event(
                     EventType.SUGGESTION_SHOWN,
@@ -208,165 +325,167 @@ class Daemon:
                         "action": suggestion.action,
                         "key": suggestion.key,
                         "priority": suggestion.priority,
+                        "adjusted_priority": suggestion.adjusted_priority,
+                        "rule": suggestion.rule,
                     },
                 )
 
-            # Emit the suggestions
-            suggestions_json = self.emit_suggestions(suggestions)
+            if accepted:
+                self.save_state()
 
-            logger.debug(f"Processed event: {event.action}")
-
-            return suggestions_json
+            # Only push to the overlay when there is something new to show, or to clear
+            # it after the user accepted a suggestion. Empty results (e.g. focus changes
+            # or cooled-down rules) leave the current suggestions alone; the overlay
+            # hides them on its own timeout.
+            return self.emit_suggestions(suggestions, force=bool(accepted))
 
         except Exception as e:
-            logger.error(f"Error processing event: {e}")
-            if self.log_events:
-                processing_time = time.time() - start_time
-                logger.error(f"Event processing failed after {processing_time:.3f}s: {e}")
-
-            # Log error to telemetry
+            processing_time = time.perf_counter() - start_time
+            logger.error("Error processing event: %s", e)
             log_event(
                 EventType.ERROR_OCCURRED,
-                duration=time.time() - start_time,
+                duration=processing_time,
                 properties={"error": str(e), "error_type": type(e).__name__},
             )
             raise
+
+    def _check_acceptance(self, event: Event, now: datetime) -> list[str]:
+        """Mark shown suggestions as accepted when the user performs them."""
+        # Drop expired pending suggestions
+        expired = [
+            action
+            for action, (_, shown_at) in self._pending.items()
+            if (now - shown_at).total_seconds() > self.acceptance_window
+        ]
+        for action in expired:
+            del self._pending[action]
+
+        if event.type in CONTEXT_EVENT_TYPES or event.action not in self._pending:
+            return []
+
+        rule_name, shown_at = self._pending.pop(event.action)
+        self.policy_engine.mark_accepted(event.action, rule_name, now=now)
+        log_event(
+            EventType.SUGGESTION_ACCEPTED,
+            properties={
+                "action": event.action,
+                "rule": rule_name,
+                "seconds_after_shown": (now - shown_at).total_seconds(),
+            },
+        )
+        logger.info("Suggestion accepted: %s (rule %s)", event.action, rule_name)
+        # Anything else that was on screen is now stale
+        self._pending.clear()
+        return [event.action]
 
     def ping(self) -> str:
         """Simple ping method to check if daemon is alive."""
         return "pong"
 
-    def emit_suggestions(self, suggestions: list[SuggestionResult]) -> str:
-        """Emit suggestions (as signal if DBus available, or via callback)."""
-        # Convert suggestions to JSON
-        suggestions_json = json.dumps(
-            [
-                {
-                    "action": s.action,
-                    "key": s.key,
-                    "description": s.description,
-                    "priority": s.priority,
-                }
-                for s in suggestions
-            ]
-        )
-        logger.debug(f"Emitted suggestions: {suggestions_json}")
+    def emit_suggestions(self, suggestions: list[SuggestionResult], *, force: bool = False) -> str:
+        """Emit suggestions on DBus and/or the in-process callback; return the JSON."""
+        suggestions_json = suggestions_to_json(suggestions)
+        if not suggestions and not force:
+            return suggestions_json
 
-        # If not using DBus, call the callback if available
-        if not self.enable_dbus and self.suggestions_callback:
+        logger.debug("Emitting suggestions: %s", suggestions_json)
+        if self._dbus_adaptor is not None:
+            self._dbus_adaptor.Suggestions.emit(suggestions_json)
+        if self.suggestions_callback is not None:
             self.suggestions_callback(suggestions)
-
         return suggestions_json
 
     def set_suggestions_callback(self, callback: Callable[[list[SuggestionResult]], None]) -> None:
-        """Set callback for suggestions (used when DBus is not available)."""
+        """Set an in-process callback for suggestions (fallback mode, demos, tests)."""
         self.suggestions_callback = callback
 
+    # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
-        """Start the daemon."""
-        self.watcher.start()
+        """Start the config watcher and (optionally) register on the session bus.
+
+        Raises:
+            DaemonError: if DBus is enabled but the bus is unavailable or another
+                daemon already owns ``org.shortcutsage.Daemon``.
+        """
+        if self._started:
+            return
         if self.enable_dbus:
-            self._start_dbus_loop()
-            logger.info(f"Daemon started on {self.BUS_NAME}")
-        else:
-            logger.info("Daemon started (fallback mode)")
+            self._register_dbus()
+        self.watcher.start()
+        self._started = True
+        logger.info("Daemon started (%s)", BUS_NAME if self.enable_dbus else "fallback mode")
 
     def stop(self) -> None:
-        """Stop the daemon."""
-        if self.enable_dbus and self._dbus_loop is not None:
-            self._dbus_loop.quit()
-            if self._dbus_thread:
-                self._dbus_thread.join(timeout=5.0)
-            self._dbus_loop = None
-            self._dbus_thread = None
-            self._dbus_service = None
-        self.watcher.stop()
+        """Stop the daemon and persist state."""
+        if self._dbus_connection is not None:
+            self._dbus_connection.unregisterObject(OBJECT_PATH)
+            self._dbus_connection.unregisterService(BUS_NAME)
+        self._dbus_connection = None
+        self._dbus_adaptor = None
+        self._dbus_object = None
+        if self._started:
+            self.watcher.stop()
+        self._started = False
+        self.save_state()
+        log_event(EventType.DAEMON_STOP)
         logger.info("Daemon stopped")
 
-    def _start_dbus_loop(self) -> None:
-        """Start the GLib main loop in a background thread for DBus."""
-        if not self.enable_dbus:
-            return
+    def _register_dbus(self) -> None:
+        if QCoreApplication.instance() is None:
+            # QtDBus delivers calls through the Qt event loop.
+            self._qt_app = QCoreApplication([sys.argv[0] if sys.argv else "shortcut-sage"])
 
-        if self._dbus_thread is not None:
-            return
+        connection = QDBusConnection.sessionBus()
+        if not connection.isConnected():
+            raise DaemonError(
+                "Cannot connect to the DBus session bus "
+                f"({connection.lastError().message() or 'no DBUS_SESSION_BUS_ADDRESS?'})"
+            )
 
-        ready = threading.Event()
-        daemon = self
+        obj = QObject()
+        adaptor = _DaemonAdaptor(obj, self)
+        if not connection.registerObject(OBJECT_PATH, obj):
+            raise DaemonError(f"Could not register DBus object {OBJECT_PATH}")
+        if not connection.registerService(BUS_NAME):
+            connection.unregisterObject(OBJECT_PATH)
+            raise DaemonError(
+                f"Could not claim {BUS_NAME} - is another Shortcut Sage daemon running? "
+                f"({connection.lastError().message()})"
+            )
+        self._dbus_connection = connection
+        self._dbus_object = obj
+        self._dbus_adaptor = adaptor
 
-        def _loop() -> None:
-            try:
-                DBusGMainLoop(set_as_default=True)
 
-                class DBusService(dbus.service.Object):  # type: ignore[misc]
-                    """DBus wrapper exposing daemon methods and signals."""
+if DBUS_AVAILABLE:
 
-                    def __init__(self) -> None:
-                        bus_name = dbus.service.BusName(daemon.BUS_NAME, bus=dbus.SessionBus())
-                        super().__init__(bus_name, daemon.OBJECT_PATH)
+    @ClassInfo({"D-Bus Interface": INTERFACE})  # type: ignore[call-arg]
+    class _DaemonAdaptor(QDBusAbstractAdaptor):  # type: ignore[operator]
+        """Exports the daemon on DBus."""
 
-                    @dbus.service.method(  # type: ignore[misc]
-                        "org.shortcutsage.Daemon",
-                        in_signature="s",
-                        out_signature="",
-                    )
-                    def SendEvent(self, event_json: str) -> None:  # noqa: N802 - DBus convention
-                        """DBus method to send an event."""
-                        logger.info("DBus SendEvent invoked")
-                        suggestions_json = daemon.send_event(event_json)
-                        if suggestions_json:
-                            self.Suggestions(suggestions_json)
+        Suggestions = Signal(str)
 
-                    @dbus.service.method(  # type: ignore[misc]
-                        "org.shortcutsage.Daemon",
-                        in_signature="",
-                        out_signature="s",
-                    )
-                    def Ping(self) -> str:  # noqa: N802 - DBus convention
-                        """DBus method to ping."""
-                        logger.info("DBus Ping invoked")
-                        result = daemon.ping()
-                        logger.info("DBus Ping returning %s", result)
-                        return dbus.String(result)
+        def __init__(self, parent: QObject, daemon: Daemon) -> None:
+            super().__init__(parent)
+            self._daemon = daemon
 
-                    @dbus.service.signal(  # type: ignore[misc]
-                        "org.shortcutsage.Daemon",
-                        signature="s",
-                    )
-                    def Suggestions(self, suggestions_json: str) -> None:  # noqa: N802 - DBus convention
-                        """Suggestions signal fired after each processed event."""
-                        return None
+        @Slot(str)
+        def SendEvent(self, event_json: str) -> None:  # noqa: N802 - DBus naming
+            # Errors are already logged; a bad payload must never kill the daemon.
+            with contextlib.suppress(Exception):
+                self._daemon.send_event(event_json)
 
-                    @dbus.service.method(  # type: ignore[misc]
-                        "org.shortcutsage.Daemon",
-                        in_signature="",
-                        out_signature="aa{sv}",
-                    )
-                    def GetBufferState(self) -> dbus.Array:  # noqa: N802 - DBus convention
-                        """Return the current buffer contents for debugging/tests."""
-                        payload = dbus.Array(signature="a{sv}")
-                        for event_dict in daemon._buffer_snapshot():
-                            entry = dbus.Dictionary(signature="sv")
-                            for key, value in event_dict.items():
-                                if isinstance(value, dict):
-                                    entry[key] = dbus.Dictionary(value, signature="sv")
-                                else:
-                                    entry[key] = value
-                            payload.append(entry)
-                        return payload
+        @Slot(result=str)
+        def Ping(self) -> str:  # noqa: N802 - DBus naming
+            return self._daemon.ping()
 
-                self._dbus_service = DBusService()
-                self._dbus_loop = GLib.MainLoop()
-                ready.set()
-                self._dbus_loop.run()
-            except Exception as exc:
-                logger.exception("DBus loop crashed: %s", exc)
-                ready.set()
-                raise
+        @Slot(result=str)
+        def GetBufferState(self) -> str:  # noqa: N802 - DBus naming
+            return self._daemon.get_buffer_state_json()
 
-        self._dbus_thread = threading.Thread(target=_loop, daemon=True)
-        self._dbus_thread.start()
-        ready.wait(timeout=2.0)
+        @Slot(result=str)
+        def GetStatus(self) -> str:  # noqa: N802 - DBus naming
+            return json.dumps(self._daemon.get_status())
 
 
 def run_daemon(
@@ -375,8 +494,9 @@ def run_daemon(
     *,
     enable_dbus: bool | None = None,
     log_events: bool = True,
-) -> None:
-    """Run the daemon with the provided configuration."""
+    log_window_titles: bool = False,
+) -> int:
+    """Run the daemon until SIGINT/SIGTERM. Returns a process exit code."""
     root_logger = logging.getLogger()
     if not root_logger.handlers:
         logging.basicConfig(
@@ -384,32 +504,46 @@ def run_daemon(
             format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         )
 
+    app = QCoreApplication.instance() or QCoreApplication(
+        [sys.argv[0] if sys.argv else "shortcut-sage"]
+    )
     effective_dbus = DBUS_AVAILABLE if enable_dbus is None else enable_dbus
 
-    daemon = Daemon(config_dir, enable_dbus=effective_dbus, log_events=log_events, log_dir=log_dir)
+    try:
+        daemon = Daemon(
+            config_dir,
+            enable_dbus=effective_dbus,
+            log_events=log_events,
+            log_dir=log_dir,
+            log_window_titles=log_window_titles,
+        )
+        daemon.start()
+    except (ConfigError, DaemonError) as e:
+        logger.error("%s", e)
+        return 1
 
     def _signal_handler(signum: int, frame: Any) -> None:
         logger.info("Received signal %s, shutting down daemon", signum)
-        log_event(EventType.DAEMON_STOP, properties={"signal": signum})
-        daemon.stop()
-        sys.exit(0)
+        app.quit()
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    daemon.start()
+    # Let the Python interpreter run signal handlers while Qt's loop is blocking.
+    heartbeat = QTimer()
+    heartbeat.start(250)
+    heartbeat.timeout.connect(lambda: None)
 
     logger.info(
         "Daemon running (%s). Press Ctrl+C to stop.",
         "DBus" if daemon.enable_dbus else "fallback",
     )
     try:
-        while True:
-            time.sleep(1.0)
-    except KeyboardInterrupt:
-        logger.info("Interrupted, shutting down daemon")
-        log_event(EventType.DAEMON_STOP, properties={"signal": "SIGINT"})
+        app.exec()
+    finally:
+        heartbeat.stop()
         daemon.stop()
+    return 0
 
 
 def main() -> None:
@@ -420,4 +554,8 @@ def main() -> None:
 
     config_dir = sys.argv[1]
     log_dir = sys.argv[2] if len(sys.argv) > 2 else None
-    run_daemon(config_dir, log_dir)
+    sys.exit(run_daemon(config_dir, log_dir))
+
+
+if __name__ == "__main__":
+    main()

@@ -47,33 +47,33 @@ def ensure_screenshot_dir() -> Path:
     return screenshots_dir
 
 
-def take_screenshot(name: str, screenshots_dir: Path) -> Path | None:
-    """Take a screenshot using available tools."""
+def take_screenshot(name: str, screenshots_dir: Path, widget=None) -> Path | None:
+    """Take a screenshot using available tools (falls back to grabbing the widget)."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = screenshots_dir / f"overlay_test_{name}_{timestamp}.png"
 
     # Try different screenshot tools
     tools = [
-        ["scrot", "-o", str(filename)],                   # Generic X11 (works with xvfb)
-        ["import", "-window", "root", str(filename)],     # ImageMagick
-        ["spectacle", "-b", "-n", "-o", str(filename)],   # KDE
-        ["gnome-screenshot", "-f", str(filename)],        # GNOME
+        ["scrot", "-o", str(filename)],  # Generic X11 (works with xvfb)
+        ["import", "-window", "root", str(filename)],  # ImageMagick
+        ["spectacle", "-b", "-n", "-o", str(filename)],  # KDE
+        ["gnome-screenshot", "-f", str(filename)],  # GNOME
     ]
 
     for tool_cmd in tools:
         try:
-            result = subprocess.run(
-                tool_cmd,
-                capture_output=True,
-                timeout=10
-            )
+            result = subprocess.run(tool_cmd, capture_output=True, timeout=10)
             if result.returncode == 0 and filename.exists():
                 print(f"  ✓ Screenshot saved: {filename.name}")
                 return filename
         except (subprocess.TimeoutExpired, FileNotFoundError):
             continue
 
-    print(f"  ✗ Failed to take screenshot (tried scrot, import, spectacle, gnome-screenshot)")
+    if widget is not None and widget.grab().save(str(filename)):
+        print(f"  ✓ Widget grab saved: {filename.name} (no screenshot tool available)")
+        return filename
+
+    print("  ✗ Failed to take screenshot (tried scrot, import, spectacle, gnome-screenshot)")
     return None
 
 
@@ -96,9 +96,16 @@ def run_visual_tests() -> dict[str, Path | None]:
     app = QApplication([sys.argv[0]])
     app.setApplicationName("ShortcutSageVisualTest")
 
-    # Create overlay in fallback mode (no DBus needed)
+    # Create overlay in fallback mode (no DBus needed, never auto-hide)
     print("1. Creating overlay window...")
-    overlay = OverlayWindow(dbus_available=False)
+    overlay = OverlayWindow(dbus_available=False, timeout_seconds=0)
+
+    def settle(seconds: float) -> None:
+        """Wait while keeping the event loop running (fade animations need it)."""
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
 
     # Test sequence
     def test_sequence():
@@ -108,24 +115,21 @@ def run_visual_tests() -> dict[str, Path | None]:
         print("\n2. Test: Empty overlay (no suggestions)")
         overlay.show()
         overlay.raise_()
-        app.processEvents()
-        time.sleep(0.5)
-        results["01_empty"] = take_screenshot("01_empty", screenshots_dir)
+        settle(0.6)
+        results["01_empty"] = take_screenshot("01_empty", screenshots_dir, overlay)
 
         # Test 2: With demo suggestions (2 chips)
         print("\n3. Test: Overlay with demo suggestions (2 chips)")
         overlay.set_suggestions_fallback(DEMO_SUGGESTIONS)
-        app.processEvents()
-        time.sleep(0.5)
+        settle(0.6)
         # Key fix: use consistent naming "02_suggestions" for both dict key and filename
-        results["02_suggestions"] = take_screenshot("02_suggestions", screenshots_dir)
+        results["02_suggestions"] = take_screenshot("02_suggestions", screenshots_dir, overlay)
 
         # Test 3: Single suggestion
         print("\n4. Test: Single suggestion")
         overlay.set_suggestions_fallback([DEMO_SUGGESTIONS[0]])
-        app.processEvents()
-        time.sleep(0.5)
-        results["03_single"] = take_screenshot("03_single", screenshots_dir)
+        settle(0.6)
+        results["03_single"] = take_screenshot("03_single", screenshots_dir, overlay)
 
         # Test 4: Four suggestions - tests truncation to max 3
         print("\n5. Test: Maximum suggestions (4 input → 3 displayed)")
@@ -145,16 +149,14 @@ def run_visual_tests() -> dict[str, Path | None]:
         ]
         # This tests that only 3 chips are shown even with 4 suggestions
         overlay.set_suggestions_fallback(four_suggestions)
-        app.processEvents()
-        time.sleep(0.5)
-        results["04_max_three"] = take_screenshot("04_max_three", screenshots_dir)
+        settle(0.6)
+        results["04_max_three"] = take_screenshot("04_max_three", screenshots_dir, overlay)
 
         # Test 5: Clear suggestions
         print("\n6. Test: Cleared suggestions")
         overlay.set_suggestions_fallback([])
-        app.processEvents()
-        time.sleep(0.5)
-        results["05_cleared"] = take_screenshot("05_cleared", screenshots_dir)
+        settle(0.6)
+        results["05_cleared"] = take_screenshot("05_cleared", screenshots_dir, overlay)
 
         # Done
         print("\n" + "=" * 60)
@@ -186,6 +188,9 @@ def run_visual_tests() -> dict[str, Path | None]:
 
 def check_environment() -> bool:
     """Check that we're in a graphical environment."""
+    if os.environ.get("QT_QPA_PLATFORM") == "offscreen":
+        print("Display: offscreen (widget grabs only)")
+        return True
     display = os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
     if not display:
         print("ERROR: No display available (DISPLAY or WAYLAND_DISPLAY not set)")
@@ -210,9 +215,9 @@ def main() -> int:
         successful = sum(1 for r in results.values() if r is not None)
         total = len(REQUIRED_TESTS)
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"RESULT: {successful}/{total} screenshots captured")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Require ALL screenshots for success
         if successful == total:
@@ -230,6 +235,7 @@ def main() -> int:
     except Exception as e:
         print(f"ERROR: {e}")
         import traceback
+
         traceback.print_exc()
         return 1
 

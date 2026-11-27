@@ -17,14 +17,14 @@ setup:
     .venv/bin/pip install -e ".[dev]"
     @echo "✓ Setup complete. Activate with: source .venv/bin/activate"
 
-# Install without dbus (for environments without libdbus-1-dev)
+# Install runtime + test deps without the dev extras resolver
 setup-minimal:
     python3 -m venv .venv
     .venv/bin/pip install --upgrade pip
     .venv/bin/pip install pydantic pyyaml PySide6 watchdog
     .venv/bin/pip install pytest pytest-cov pytest-qt ruff mypy types-PyYAML
     .venv/bin/pip install -e . --no-deps
-    @echo "✓ Minimal setup complete (no dbus). Activate with: source .venv/bin/activate"
+    @echo "✓ Minimal setup complete. Activate with: source .venv/bin/activate"
 
 # Install anthropic for Claude validation
 setup-claude:
@@ -47,12 +47,21 @@ test-unit:
 test-integration:
     .venv/bin/pytest tests/integration/ -v
 
-# Run tests without Qt/DBus (headless compatible)
+# Run tests headless (DBus integration tests skip without a session bus)
 test-headless:
-    .venv/bin/pytest tests/unit/ tests/integration/ \
-        --ignore=tests/unit/test_overlay.py \
-        --ignore=tests/integration/test_dbus.py \
-        -v --no-cov
+    QT_QPA_PLATFORM=offscreen .venv/bin/pytest tests/ -v --no-cov
+
+# Run the full suite inside a private DBus session (what CI does)
+test-dbus:
+    QT_QPA_PLATFORM=offscreen dbus-run-session -- .venv/bin/pytest tests/
+
+# KWin script tests against a mocked KWin API (needs node)
+test-kwin:
+    node --test tests/kwin/main.test.js
+
+# Install/upgrade and enable the KWin script
+install-kwin:
+    scripts/install-kwin-script.sh
 
 # Run tests with coverage
 test-cov:
@@ -117,6 +126,10 @@ overlay:
 demo:
     .venv/bin/python -m sage overlay --demo
 
+# Live developer debug panel
+dev-hints:
+    .venv/bin/dev-hints
+
 # Run the doctor diagnostic tool
 doctor:
     .venv/bin/shortcut-sage-doctor
@@ -147,7 +160,7 @@ clean-all: clean clean-venv
 # ============================================================================
 
 # Simulate CI checks locally
-ci: format-check lint test-headless
+ci: format-check lint test-kwin test-headless
     @echo "✓ CI simulation passed"
 
 # Simulate full visual test CI

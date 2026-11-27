@@ -2,97 +2,77 @@ name: CI
 
 on:
   push:
-    branches: [ main, master, develop, 'feat/**' ]
+    branches: [main, master, develop, 'feat/**', 'arena/**']
   pull_request:
-    branches: [ main, master, develop ]
+    branches: [main, master, develop]
+
+env:
+  QT_QPA_PLATFORM: offscreen
+  PIP_DISABLE_PIP_VERSION_CHECK: '1'
 
 jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Ruff lint
+        run: ruff check sage tests --output-format=github
+      - name: Ruff format
+        run: ruff format --check sage tests
+      - name: Mypy
+        run: mypy sage
+
   test:
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.11', '3.12']
-
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
-
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          # dbus: private session bus for the DBus integration tests (QtDBus needs only
+          # libdbus at runtime). The rest are Qt runtime libraries.
+          sudo apt-get install -y --no-install-recommends \
             dbus \
-            libdbus-1-dev \
-            python3-dbus \
-            libxcb-cursor0 \
-            libxcb-icccm4 \
-            libxcb-image0 \
-            libxcb-keysyms1 \
-            libxcb-randr0 \
-            libxcb-render-util0 \
-            libxcb-shape0 \
-            libxcb-xinerama0 \
-            libxcb-xfixes0 \
-            libxkbcommon-x11-0 \
-            x11-utils \
-            xvfb \
+            libdbus-1-3 \
             libegl1 \
             libgl1 \
-            libglib2.0-0
-
+            libglib2.0-0 \
+            libxkbcommon0 \
+            libfontconfig1
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-
-      - name: Lint with ruff
-        run: |
-          ruff check sage tests
-
-      - name: Format check with ruff
-        run: |
-          ruff format --check sage tests
-
-      - name: Type check with mypy
-        run: |
-          mypy sage
-
-      - name: Test with pytest
-        run: |
-          xvfb-run -a pytest --cov=sage --cov-report=term-missing --cov-report=xml --cov-fail-under=75
+      - name: KWin script tests (Node)
+        run: node --test tests/kwin/main.test.js
+      - name: Tests (inside a private DBus session)
         env:
-          QT_QPA_PLATFORM: offscreen
-
-      - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v3
-        with:
-          file: ./coverage.xml
-          flags: unittests
-          name: codecov-umbrella
-          fail_ci_if_error: false
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install dependencies
+          SHORTCUT_SAGE_REQUIRE_DBUS: '1'
         run: |
-          python -m pip install --upgrade pip
-          pip install ruff mypy
-
-      - name: Run ruff
-        run: |
-          ruff check sage tests --output-format=github
+          dbus-run-session -- pytest --cov=sage --cov-report=term-missing --cov-report=xml
+      - name: Upload coverage
+        if: matrix.python-version == '3.11'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 14

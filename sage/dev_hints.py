@@ -1,198 +1,217 @@
-"""Developer hints and debugging panel for Shortcut Sage."""
+"""Developer hints panel: live view of a running daemon.
 
+Runs as a separate process, so it cannot read the daemon's in-memory metrics. Instead
+it polls the daemon over DBus (``GetStatus`` / ``GetBufferState``) and tails the
+daemon's telemetry file (``~/.local/share/shortcut-sage/logs/telemetry.ndjson``).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
 import sys
+from collections import Counter, deque
+from pathlib import Path
+from typing import Any
 
-from PySide6.QtCore import QCoreApplication, Qt, QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
-    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from sage.telemetry import get_telemetry
+
+def default_log_file() -> Path:
+    from sage.dbus_daemon import default_data_dir
+
+    return default_data_dir() / "logs" / "telemetry.ndjson"
+
+
+def read_recent_telemetry(log_file: Path, limit: int = 200) -> list[dict[str, Any]]:
+    """Return the last ``limit`` telemetry entries (malformed lines skipped)."""
+    if not log_file.exists():
+        return []
+    entries: deque[dict[str, Any]] = deque(maxlen=limit)
+    with open(log_file, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entry, dict):
+                entries.append(entry)
+    return list(entries)
+
+
+def summarize(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    """Counts, acceptance rate and average processing time from telemetry entries."""
+    counts = Counter(str(e.get("event_type", "unknown")) for e in entries)
+    durations = [
+        float(e["duration"])
+        for e in entries
+        if e.get("event_type") == "event_received" and isinstance(e.get("duration"), int | float)
+    ]
+    shown = counts.get("suggestion_shown", 0)
+    accepted = counts.get("suggestion_accepted", 0)
+    return {
+        "events": counts.get("event_received", 0),
+        "shown": shown,
+        "accepted": accepted,
+        "errors": counts.get("error_occurred", 0),
+        "acceptance_rate": (accepted / shown) if shown else 0.0,
+        "avg_processing_ms": (sum(durations) / len(durations) * 1000) if durations else 0.0,
+    }
+
+
+def format_entry(entry: dict[str, Any]) -> str:
+    ts = str(entry.get("timestamp", ""))
+    time_part = ts[11:23] if len(ts) >= 23 else ts
+    line = f"[{time_part}] {entry.get('event_type', '?')}"
+    if isinstance(entry.get("duration"), int | float):
+        line += f" ({entry['duration'] * 1000:.1f} ms)"
+    props = entry.get("properties")
+    if props:
+        line += f" {json.dumps(props, default=str)}"
+    return line
 
 
 class DevHintsPanel(QWidget):
-    """Developer debugging panel showing internal state and hints."""
+    """Developer debugging panel showing the daemon's state and recent activity."""
 
-    def __init__(self) -> None:
+    def __init__(self, log_file: Path | None = None, refresh_ms: int = 2000) -> None:
         super().__init__()
-
-        self.telemetry = get_telemetry()
+        self.log_file = log_file or default_log_file()
+        self._client: Any = None
         self.setup_ui()
-        self.setup_refresh_timer()
-
-    def setup_ui(self) -> None:
-        """Set up the UI for the dev hints panel."""
-        self.setWindowTitle("Shortcut Sage - Dev Hints Panel")
-        self.setGeometry(100, 100, 800, 600)
-
-        # Main layout
-        main_layout = QVBoxLayout(self)
-
-        # Title
-        title_label = QLabel("Shortcut Sage - Developer Hints & Debug Info")
-        title_font = QFont()
-        title_font.setBold(True)
-        title_font.setPointSize(14)
-        title_label.setFont(title_font)
-        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        main_layout.addWidget(title_label)
-
-        # Stats section
-        self.stats_text = QTextEdit()
-        self.stats_text.setMaximumHeight(150)
-        self.stats_text.setReadOnly(True)
-        main_layout.addWidget(QLabel("Runtime Statistics:"))
-        main_layout.addWidget(self.stats_text)
-
-        # Divider
-        divider = QFrame()
-        divider.setFrameShape(QFrame.Shape.HLine)
-        divider.setFrameShadow(QFrame.Shadow.Sunken)
-        main_layout.addWidget(divider)
-
-        # Suggestions trace
-        self.suggestions_trace = QTextEdit()
-        self.suggestions_trace.setMaximumHeight(150)
-        self.suggestions_trace.setReadOnly(True)
-        main_layout.addWidget(QLabel("Recent Suggestions Trace:"))
-        main_layout.addWidget(self.suggestions_trace)
-
-        # Divider
-        main_layout.addWidget(divider)
-
-        # Event trace
-        self.events_trace = QTextEdit()
-        self.events_trace.setReadOnly(True)
-        main_layout.addWidget(QLabel("Recent Events Trace:"))
-
-        # Scroll area for event trace
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(self.events_trace)
-        scroll_area.setWidgetResizable(True)
-        main_layout.addWidget(scroll_area)
-
-        # Controls
-        controls_layout = QHBoxLayout()
-
-        self.refresh_btn = QPushButton("Refresh")
-        self.refresh_btn.clicked.connect(self.refresh_data)
-
-        self.clear_btn = QPushButton("Clear Traces")
-        self.clear_btn.clicked.connect(self.clear_traces)
-
-        controls_layout.addWidget(self.refresh_btn)
-        controls_layout.addWidget(self.clear_btn)
-        controls_layout.addStretch()
-
-        main_layout.addLayout(controls_layout)
-
-    def setup_refresh_timer(self) -> None:
-        """Set up automatic refresh timer."""
         self.refresh_timer = QTimer(self)
         self.refresh_timer.timeout.connect(self.refresh_data)
-        self.refresh_timer.start(2000)  # Refresh every 2 seconds
+        if refresh_ms > 0:
+            self.refresh_timer.start(refresh_ms)
+        self.refresh_data()
+
+    def setup_ui(self) -> None:
+        self.setWindowTitle("Shortcut Sage - Dev Hints")
+        self.resize(900, 650)
+        layout = QVBoxLayout(self)
+
+        title = QLabel("Shortcut Sage - Developer Hints")
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(14)
+        title.setFont(font)
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+
+        def section(label: str, max_height: int | None = None) -> QTextEdit:
+            box = QTextEdit()
+            box.setReadOnly(True)
+            box.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+            if max_height:
+                box.setMaximumHeight(max_height)
+            layout.addWidget(QLabel(label))
+            layout.addWidget(box)
+            return box
+
+        self.stats_text = section("Daemon status & statistics:", 170)
+        self.buffer_text = section("Event buffer (what rules currently see):", 130)
+        self.suggestions_trace = section("Recent suggestions:", 130)
+        self.events_trace = section(f"Recent telemetry ({self.log_file}):")
+
+        controls = QHBoxLayout()
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh_data)
+        controls.addWidget(refresh)
+        controls.addStretch()
+        layout.addLayout(controls)
+
+    def _daemon(self) -> Any:
+        if self._client is None:
+            from sage.dbus_client import DBusClient
+
+            self._client = DBusClient(timeout_ms=1000)
+        return self._client
 
     def refresh_data(self) -> None:
-        """Refresh all displayed data."""
-        self.update_stats()
-        self.update_traces()
+        status: dict[str, Any] | None = None
+        buffer: list[dict[str, Any]] = []
+        error = ""
+        try:
+            client = self._daemon()
+            status = client.get_status()
+            buffer = client.get_buffer_state()
+        except Exception as e:  # daemon not running / no bus
+            self._client = None
+            error = str(e)
 
-    def update_stats(self) -> None:
-        """Update the statistics display."""
-        if self.telemetry:
-            metrics = self.telemetry.export_metrics()
+        entries = read_recent_telemetry(self.log_file)
+        stats = summarize(entries)
 
-            stats_text = f"""Runtime Statistics:
-Uptime: {metrics.get("uptime", 0):.1f}s
-Total Events Processed: {metrics["counters"].get("event_received", 0)}
-Suggestions Shown: {metrics["counters"].get("suggestion_shown", 0)}
-Suggestions Accepted: {metrics["counters"].get("suggestion_accepted", 0)}
-Errors: {metrics["counters"].get("error_occurred", 0)}
-
-Performance:
-Event Processing Time: {metrics["histograms"].get("event_received", {}).get("avg", 0):.3f}s avg
-Last 10 Events: {len(self.telemetry.metrics.events)}"""
-
-            self.stats_text.setPlainText(stats_text)
+        lines = []
+        if status is not None:
+            lines.append(
+                f"Daemon: running (v{status.get('version')}), rules={status.get('rules')}, "
+                f"shortcuts={status.get('shortcuts')}, buffer window={status.get('buffer_window')}s"
+            )
+            lines.append(
+                f"On screen now: {', '.join(status.get('pending_suggestions', [])) or '-'}"
+            )
+            lines.append(f"Config: {status.get('config_dir')}")
         else:
-            self.stats_text.setPlainText("Telemetry not initialized - start the daemon first")
+            lines.append(f"Daemon: NOT reachable ({error or 'unknown error'})")
+            lines.append("Start it with: shortcut-sage daemon")
+        lines.append("")
+        lines.append(
+            f"Last {len(entries)} log entries: {stats['events']} events, {stats['shown']} "
+            f"suggestions shown, {stats['accepted']} accepted "
+            f"({stats['acceptance_rate']:.0%}), {stats['errors']} errors, "
+            f"avg processing {stats['avg_processing_ms']:.2f} ms"
+        )
+        if stats["events"] and not stats["shown"]:
+            lines.append(
+                "Hint: events arrive but nothing is suggested - check rules.yaml patterns."
+            )
+        if status is not None and not stats["events"]:
+            lines.append("Hint: no events logged - is the KWin script installed and enabled?")
+        self.stats_text.setPlainText("\n".join(lines))
 
-    def update_traces(self) -> None:
-        """Update the trace displays."""
-        if self.telemetry:
-            # Get recent events
-            recent_events = list(self.telemetry.metrics.events)[-20:]  # Last 20 events
-
-            # Format events
-            event_lines = []
-            suggestion_lines = []
-
-            for event in recent_events:
-                timestamp = event.timestamp.strftime("%H:%M:%S.%f")[:-3]  # Show ms
-                event_line = f"[{timestamp}] {event.event_type.value}"
-
-                if event.duration:
-                    event_line += f" (took {event.duration:.3f}s)"
-
-                if event.properties:
-                    event_line += f" - {event.properties}"
-
-                event_lines.append(event_line)
-
-                # Extract suggestion info
-                if event.event_type.value == "suggestion_shown" and event.properties:
-                    suggestion_lines.append(
-                        f"[{timestamp}] SUGGESTION: {event.properties.get('action', 'N/A')} "
-                        f"({event.properties.get('key', 'N/A')}) priority={event.properties.get('priority', 'N/A')}"
-                    )
-
-            # Update text areas
-            self.events_trace.setPlainText("\n".join(reversed(event_lines)))
-            self.suggestions_trace.setPlainText(
-                "\n".join(reversed(suggestion_lines[-10:]))
-            )  # Last 10 suggestions
-        else:
-            self.events_trace.setPlainText("No telemetry data available")
-            self.suggestions_trace.setPlainText("No suggestion data available")
-
-    def clear_traces(self) -> None:
-        """Clear all trace information."""
-        if self.telemetry:
-            self.telemetry.metrics.events.clear()
-        self.events_trace.clear()
-        self.suggestions_trace.clear()
+        self.buffer_text.setPlainText(
+            "\n".join(
+                f"{e.get('timestamp', '')[11:19]} {e.get('type')}/{e.get('action')} "
+                f"{json.dumps(e.get('metadata') or {})}"
+                for e in buffer
+            )
+            or "(empty)"
+        )
+        self.suggestions_trace.setPlainText(
+            "\n".join(
+                format_entry(e)
+                for e in reversed(entries)
+                if e.get("event_type") in ("suggestion_shown", "suggestion_accepted")
+            )[:20000]
+        )
+        self.events_trace.setPlainText(
+            "\n".join(format_entry(e) for e in reversed(entries[-50:])) or "(no telemetry yet)"
+        )
 
 
-def show_dev_hints() -> tuple[QCoreApplication | QApplication, DevHintsPanel]:
-    """Show the developer hints panel."""
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication(sys.argv)
-
-    panel = DevHintsPanel()
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="dev-hints")
+    parser.add_argument("--log-file", type=Path, default=None, help="telemetry.ndjson to read")
+    args = parser.parse_args(argv)
+    app = QApplication.instance() or QApplication(sys.argv)
+    panel = DevHintsPanel(args.log_file)
     panel.show()
-
-    return app, panel
-
-
-def main() -> None:
-    """Main entry point for dev hints panel."""
-    app = QApplication(sys.argv)
-
-    panel = DevHintsPanel()
-    panel.show()
-
-    sys.exit(app.exec())
+    return int(app.exec())
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

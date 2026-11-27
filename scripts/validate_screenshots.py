@@ -48,7 +48,7 @@ VALIDATION_CRITERIA: dict[str, dict[str, str | list[str]]] = {
         "description": "Overlay showing two demo suggestions",
         "must_have": [
             "Two suggestion chips visible",
-            "Text 'Meta+Tab' visible as a keyboard shortcut",
+            "Text 'Meta+W' visible as a keyboard shortcut",
             "Text 'Meta+Left' visible as a keyboard shortcut",
             "Description text near each shortcut",
             "Dark/semi-transparent background on chips",
@@ -63,7 +63,7 @@ VALIDATION_CRITERIA: dict[str, dict[str, str | list[str]]] = {
         "description": "Overlay showing exactly one suggestion",
         "must_have": [
             "Exactly one suggestion chip visible",
-            "Text 'Meta+Tab' visible",
+            "Text 'Meta+W' visible",
             "Description text visible",
         ],
         "must_not_have": [
@@ -76,7 +76,7 @@ VALIDATION_CRITERIA: dict[str, dict[str, str | list[str]]] = {
         "description": "Overlay showing maximum of 3 suggestions (4 were provided, verifying truncation)",
         "must_have": [
             "Exactly three suggestion chips visible",
-            "Text 'Meta+Tab' visible",
+            "Text 'Meta+W' visible",
             "Text 'Meta+Left' visible",
             "Text 'Meta+Right' visible",
             "Chips arranged horizontally or in a row",
@@ -145,8 +145,8 @@ def build_validation_prompt(criteria: dict[str, str | list[str]]) -> str:
 
 **Context**: Shortcut Sage is a KDE Plasma desktop tool that suggests keyboard shortcuts based on user actions. The overlay displays suggestion "chips" - small UI elements showing a keyboard shortcut and description.
 
-**Test Scenario**: {criteria['name']}
-**Expected State**: {criteria['description']}
+**Test Scenario**: {criteria["name"]}
+**Expected State**: {criteria["description"]}
 
 ## Validation Criteria
 
@@ -259,7 +259,7 @@ def validate_screenshot_with_claude(
         except anthropic.APIConnectionError as e:
             last_error = f"Connection error: {e}"
             if attempt < max_retries - 1:
-                time.sleep(2 ** attempt)  # Exponential backoff
+                time.sleep(2**attempt)  # Exponential backoff
                 continue
         except anthropic.RateLimitError as e:
             last_error = f"Rate limit error: {e}"
@@ -347,9 +347,9 @@ def find_screenshots(screenshots_dir: Path) -> dict[str, Path]:
 def print_result(result: ValidationResult) -> None:
     """Print a validation result."""
     status = "✅ PASS" if result.passed else "❌ FAIL"
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"{status} | {result.test_name} | Confidence: {result.confidence}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Reasoning: {result.reasoning}")
 
     if result.error:
@@ -376,7 +376,9 @@ def generate_report(results: list[ValidationResult], output_path: Path | None) -
             "passed": sum(1 for r in results if r.passed),
             "failed": sum(1 for r in results if not r.passed),
             "errors": len(errors),
-            "pass_rate": f"{sum(1 for r in results if r.passed) / len(results) * 100:.1f}%" if results else "0%",
+            "pass_rate": f"{sum(1 for r in results if r.passed) / len(results) * 100:.1f}%"
+            if results
+            else "0%",
         },
         "results": [
             {
@@ -403,9 +405,7 @@ def generate_report(results: list[ValidationResult], output_path: Path | None) -
 
 def main() -> int:
     """Main entry point."""
-    parser = argparse.ArgumentParser(
-        description="Validate overlay screenshots using Claude vision"
-    )
+    parser = argparse.ArgumentParser(description="Validate overlay screenshots using Claude vision")
     parser.add_argument(
         "screenshots_dir",
         type=Path,
@@ -427,6 +427,7 @@ def main() -> int:
 
     # Get API key
     import os
+
     api_key = args.api_key or os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
         print("ERROR: ANTHROPIC_API_KEY environment variable not set")
@@ -473,9 +474,9 @@ def main() -> int:
     report = generate_report(results, args.output)
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("VALIDATION SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     print(f"Total:  {report['summary']['total']}")
     print(f"Passed: {report['summary']['passed']}")
     print(f"Failed: {report['summary']['failed']}")

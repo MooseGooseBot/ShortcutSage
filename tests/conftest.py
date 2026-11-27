@@ -1,8 +1,21 @@
 """Shared pytest fixtures."""
 
+import os
 from pathlib import Path
 
 import pytest
+
+# Headless Qt for every test, and one QApplication shared by the whole session.
+# It has to exist before anything creates a plain QCoreApplication (e.g. the DBus
+# client), otherwise later widget tests abort.
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+try:
+    from PySide6.QtWidgets import QApplication
+
+    _QT_APP = QApplication.instance() or QApplication(["shortcut-sage-tests"])
+except Exception:  # pragma: no cover - Qt unavailable
+    _QT_APP = None
 
 
 @pytest.fixture

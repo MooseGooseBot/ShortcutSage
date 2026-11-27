@@ -1,0 +1,15 @@
+[Unit]
+Description=Shortcut Sage overlay (suggestion chips)
+Documentation=https://github.com/MooseGooseBot/ShortcutSage
+PartOf=graphical-session.target
+After=graphical-session.target shortcut-sage-daemon.service
+Wants=shortcut-sage-daemon.service
+
+[Service]
+Type=simple
+ExecStart=@BINDIR@/shortcut-sage overlay
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

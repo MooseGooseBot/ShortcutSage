@@ -27,6 +27,10 @@ jobs:
   visual-test:
     name: Capture & Validate Screenshots
     runs-on: ubuntu-latest
+    env:
+      # `secrets` cannot be referenced in step `if:` conditions (that made the whole
+      # workflow invalid); expose a boolean instead.
+      HAS_ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
 
     steps:
       - name: Checkout code
@@ -42,7 +46,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libdbus-1-dev \
+            libdbus-1-3 \
             libxcb-cursor0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -109,7 +113,7 @@ jobs:
 
       - name: Validate screenshots with Claude
         id: validate
-        if: ${{ (github.event_name == 'workflow_dispatch' && inputs.run_claude_validation == true) || (github.event_name == 'pull_request' && secrets.ANTHROPIC_API_KEY != '') }}
+        if: ${{ env.HAS_ANTHROPIC_KEY == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.run_claude_validation) || github.event_name == 'pull_request') }}
         run: |
           echo "Running Claude vision validation..."
 
@@ -137,7 +141,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 
       - name: Skip validation notice
-        if: ${{ !((github.event_name == 'workflow_dispatch' && inputs.run_claude_validation == true) || (github.event_name == 'pull_request' && secrets.ANTHROPIC_API_KEY != '')) }}
+        if: ${{ !(env.HAS_ANTHROPIC_KEY == 'true' && ((github.event_name == 'workflow_dispatch' && inputs.run_claude_validation) || github.event_name == 'pull_request')) }}
         run: |
           echo "⚠️ Claude validation skipped"
           echo ""
@@ -240,7 +244,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libdbus-1-dev \
+            libdbus-1-3 \
             libxcb-cursor0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -265,6 +269,6 @@ jobs:
 
       - name: Run overlay tests
         run: |
-          xvfb-run -a pytest tests/unit/test_overlay.py tests/e2e/test_overlay_signal.py -v --no-cov
+          xvfb-run -a pytest tests/unit/test_overlay.py tests/unit/test_regressions.py::TestOverlay tests/e2e/test_overlay_signal.py -v --no-cov
         env:
           QT_QPA_PLATFORM: xcb
