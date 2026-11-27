@@ -79,6 +79,22 @@ for (const kwin6 of [true, false]) {
         assert.deepEqual(env.actions(), ["tile_left", "tile_right"]);
     });
 
+    test(`${label}: a stale pending tile does not turn a later resize into a tile event`, () => {
+        const env = createEnv({ kwin6 }).load();
+        const w = env.addWindow({});
+        const realNow = Date.now;
+        try {
+            let now = realNow();
+            Date.now = () => now;
+            w.quickTileModeChanged.emit(); // e.g. un-tile: geometry is not a tile shape
+            now += 5000; // much later the user resizes the window by hand
+            env.setGeometry(w, { x: 0, y: 0, width: 960, height: 1040 });
+            assert.deepEqual(env.actions(), []);
+        } finally {
+            Date.now = realNow;
+        }
+    });
+
     test(`${label}: quarter tiling is classified`, () => {
         const env = createEnv({ kwin6 }).load();
         const w = env.addWindow({});

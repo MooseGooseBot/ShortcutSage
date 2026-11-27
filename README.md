@@ -15,8 +15,9 @@ small overlay in the top-left corner. Think of it as "autocomplete for your hand
 
 - **Context-aware suggestions**: up to 3 shortcuts based on your recent actions, the
   focused application and window title
-- **Learns from you**: when you use a suggested shortcut it counts as accepted, and
-  suggestions you act on rank higher (persisted across restarts)
+- **Learns from you**: performing a suggested action within 30 s counts as accepting
+  it, and suggestions you act on rank higher (persisted across restarts). KWin reports
+  *what* happened, not *how*, so doing the action with the mouse also counts.
 - **Config-driven**: rules live in YAML and hot-reload while the daemon runs
 - **Uses your real bindings**: `export-shortcuts --sync` copies your actual KDE
   shortcuts into the config

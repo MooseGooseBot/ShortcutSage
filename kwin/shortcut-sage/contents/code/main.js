@@ -29,6 +29,7 @@ var OVERLAY_MARGIN = 20;
 
 var SHOW_DESKTOP_DEBOUNCE_MS = 750;
 var DUPLICATE_WINDOW_MS = 400;
+var PENDING_TILE_MS = 1000;  // how long to wait for geometry after quickTileModeChanged
 var MAXIMIZE_AREA = (typeof KWin !== "undefined" && KWin.MaximizeArea !== undefined) ? KWin.MaximizeArea : 2;
 
 var DEBUG = false;
@@ -46,7 +47,7 @@ var state = {
     lastWindowMove: 0,
     lastEmitted: {},          // window id -> {action, time}
     windowDesktop: {},        // window id -> desktop index
-    pendingTile: {},          // window id -> true while waiting for geometry
+    pendingTile: {},          // window id -> time quickTileModeChanged fired without geometry
     connected: {}             // window id -> true once per-window signals are hooked
 };
 
@@ -349,13 +350,22 @@ function hookWindow(w) {
     // Quick tiling
     connectSignal(w, "quickTileModeChanged", function () {
         if (!maybeEmitTile(w)) {
-            state.pendingTile[id] = true; // geometry not updated yet
+            // Geometry not updated yet (or the window was un-tiled): wait briefly.
+            state.pendingTile[id] = Date.now();
         }
     });
     connectSignal(w, "frameGeometryChanged", function () {
-        if (state.pendingTile[id]) {
-            maybeEmitTile(w);
+        var pendingSince = state.pendingTile[id];
+        if (pendingSince === undefined) {
+            return;
         }
+        if (Date.now() - pendingSince > PENDING_TILE_MS) {
+            // Stale (e.g. after un-tiling): a later manual resize to half the screen
+            // must not be reported as a quick-tile action.
+            delete state.pendingTile[id];
+            return;
+        }
+        maybeEmitTile(w);
     });
 
     // Maximize (KWin 6). KWin 5 uses workspace.clientMaximizeSet below.
